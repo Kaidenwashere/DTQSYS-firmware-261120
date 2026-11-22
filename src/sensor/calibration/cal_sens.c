@@ -1,0 +1,560 @@
+/*
+	SlimeVR Code is placed under the MIT license
+	Copyright (c) 2025 SlimeVR Contributors
+
+	Permission is hereby granted, free of charge, to any person obtaining a copy
+	of this software and associated documentation files (the "Software"), to deal
+	in the Software without restriction, including without limitation the rights
+	to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+	copies of the Software, and to permit persons to whom the Software is
+	furnished to do so, subject to the following conditions:
+
+	The above copyright notice and this permission notice shall be included in
+	all copies or substantial portions of the Software.
+
+	THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+	IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+	FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+	AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+	LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+	OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+	THE SOFTWARE.
+*/
+#include "globals.h"
+#include "system/system.h"
+#include "system/watchdog.h"
+
+#include <errno.h>
+#include <math.h>
+#include <zephyr/kernel.h>
+
+#include "cal_sample.h"
+#include "cal_sens.h"
+#include "calibration.h"
+#include "util.h"
+#include "connection/tracker_events.h"
+#if CONFIG_SENSOR_TCAL_HEATED
+#include "tcal_heated.h"
+#endif
+
+#if CONFIG_SENSOR_USE_SENS_CALIBRATION
+/* Serialize explicit replacements with the measurement's final application. */
+static K_MUTEX_DEFINE(sensitivity_lock);
+static uint32_t sensitivity_generation;
+static uint16_t sensitivity_operation;
+static struct led_token sensitivity_feedback;
+
+/* Initialized before IMU-ready, then updated only by the sensor owner. The
+ * generation and all three axes always describe the same applied epoch. */
+static struct sensitivity_snapshot {
+	float scale[3];
+	uint32_t generation;
+} sensitivity_cache = {{1.0f, 1.0f, 1.0f}, 0};
+static bool sensitivity_cache_seeded;
+
+static void sensitivity_replace_locked(uint8_t reason)
+{
+	cal_event_end(sensitivity_operation, CAL_OUTCOME_CANCELLED, CAL_PHASE_APPLIED, reason);
+	sensor_calibration_result(sensitivity_feedback, LED_CANCELLED);
+	sensitivity_feedback = (struct led_token){0};
+	sensitivity_operation = 0;
+	sensitivity_generation++;
+}
+
+bool sensor_calibration_sensitivity_init(void)
+{
+	/* Startup validation must share the writers' storage -> sensitivity
+	 * order, including reset-all. It finishes before IMU-ready is published. */
+	sys_warm_transaction_begin();
+	k_mutex_lock(&sensitivity_lock, K_FOREVER);
+	bool healed = false;
+	for (int i = 0; i < 3; i++) {
+		if (!sensor_calibration_sensitivity_valid(retained->gyroSensScale[i])) {
+			retained->gyroSensScale[i] = 1.0f;
+			healed = true;
+		}
+	}
+	if (healed) {
+		/* A later validation can heal retained state, but must not
+		 * mutate the cache after it belongs to the sensor owner. */
+		if (sensitivity_cache_seeded) {
+			sensitivity_generation++;
+		}
+		retained_update();
+	}
+	if (!sensitivity_cache_seeded) {
+		for (int i = 0; i < 3; i++) {
+			sensitivity_cache.scale[i] = retained->gyroSensScale[i];
+		}
+		sensitivity_cache.generation = sensitivity_generation;
+		sensitivity_cache_seeded = true;
+	}
+	k_mutex_unlock(&sensitivity_lock);
+	sys_warm_transaction_end(false);
+	return healed;
+}
+
+void sensor_calibration_apply_sensitivity(float g[3], float delta[3])
+{
+	/* A writer may hold this mutex throughout NVS. Keep the last complete
+	 * sensor-owned snapshot on contention, including its observed epoch. */
+	if (k_mutex_lock(&sensitivity_lock, K_NO_WAIT) == 0) {
+		if (sensitivity_cache.generation != sensitivity_generation) {
+			for (int i = 0; i < 3; i++) {
+				sensitivity_cache.scale[i] = retained->gyroSensScale[i];
+			}
+			sensitivity_cache.generation = sensitivity_generation;
+		}
+		k_mutex_unlock(&sensitivity_lock);
+	}
+	for (int i = 0; i < 3; i++) {
+		g[i] *= sensitivity_cache.scale[i];
+		delta[i] *= sensitivity_cache.scale[i];
+	}
+}
+
+void sensor_calibration_sensitivity_clear_begin(void)
+{
+	/* Reset-all already owns storage, matching the setter's lock order. */
+	k_mutex_lock(&sensitivity_lock, K_FOREVER);
+}
+
+void sensor_calibration_sensitivity_clear_end(void)
+{
+	sensitivity_generation++;
+	k_mutex_unlock(&sensitivity_lock);
+}
+
+static void sensitivity_step(uint16_t operation_id, struct led_token feedback, uint8_t phase, uint8_t detail)
+{
+	cal_event_step(operation_id, phase, detail);
+	sensor_calibration_stage(feedback, phase == CAL_PHASE_COLLECT ? LED_COLLECT_STILL :
+		phase == CAL_PHASE_WAIT_ROTATION ? LED_WAIT_MOVE :
+		phase == CAL_PHASE_RECORD_ROTATION ? LED_COLLECT_MOVE : LED_PROCESSING);
+	if (operation_id) {
+		tracker_events_notify();
+	}
+}
+
+static void sensitivity_failed(uint16_t operation_id, struct led_token feedback, uint8_t phase, uint8_t reason)
+{
+	k_mutex_lock(&sensitivity_lock, K_FOREVER);
+	if (feedback.session != sensitivity_feedback.session || feedback.request_id != sensitivity_feedback.request_id) {
+		k_mutex_unlock(&sensitivity_lock);
+		return; /* Explicit set/reset already ended this measurement. */
+	}
+	cal_event_end(operation_id, CAL_OUTCOME_FAILED, phase, reason);
+	sensor_calibration_result(feedback, LED_FAILED);
+	if (sensitivity_operation == operation_id) {
+		sensitivity_operation = 0;
+		sensitivity_feedback = (struct led_token){0};
+	}
+	k_mutex_unlock(&sensitivity_lock);
+	if (operation_id) {
+		tracker_events_notify();
+	}
+}
+#endif
+
+int sensor_calibration_set_sensitivity(const float degrees[3])
+{
+#if CONFIG_SENSOR_USE_SENS_CALIBRATION
+	if (!degrees) {
+		return sensor_operation_result(LED_OWNER_SENS, -EINVAL, false);
+	}
+
+	float scales[3];
+	for (int i = 0; i < 3; i++) {
+		if (!v_finite(&degrees[i], 1)) {
+			return sensor_operation_result(LED_OWNER_SENS, -EINVAL, false);
+		}
+		float denominator = 1.0f - (degrees[i] / (360.0f * CONFIG_SENSOR_SENS_REV));
+		if (!v_finite(&denominator, 1) || fabsf(denominator) < 1e-6f) {
+			return sensor_operation_result(LED_OWNER_SENS, -EINVAL, false);
+		}
+		scales[i] = 1.0f / denominator;
+		if (!sensor_calibration_sensitivity_valid(scales[i])) {
+			return sensor_operation_result(LED_OWNER_SENS, -EINVAL, false);
+		}
+	}
+	#if CONFIG_SENSOR_TCAL_HEATED
+	int reserve_err = sensor_calibration_sensitivity_maintenance_begin();
+	if (reserve_err) {
+		return sensor_operation_result(LED_OWNER_SENS, reserve_err, false);
+	}
+	#endif
+	sys_warm_transaction_begin();
+	k_mutex_lock(&sensitivity_lock, K_FOREVER);
+	bool notify = sensitivity_operation != 0;
+	int err = sys_write(MAIN_GYRO_SENS_ID, &retained->gyroSensScale, scales, sizeof(scales));
+	sensitivity_replace_locked(CAL_REASON_REPLACED);
+	k_mutex_unlock(&sensitivity_lock);
+	sys_warm_transaction_end(false);
+	#if CONFIG_SENSOR_TCAL_HEATED
+	sensor_calibration_sensitivity_maintenance_end();
+	#endif
+	if (notify) {
+		tracker_events_notify();
+	}
+	return sensor_operation_result(LED_OWNER_SENS, err, true);
+#else
+	ARG_UNUSED(degrees);
+	return sensor_operation_result(LED_OWNER_SENS, -ENOTSUP, false);
+#endif
+}
+
+int sensor_calibration_reset_sensitivity(void)
+{
+#if CONFIG_SENSOR_USE_SENS_CALIBRATION
+	float scales[3] = {1.0f, 1.0f, 1.0f};
+	#if CONFIG_SENSOR_TCAL_HEATED
+	int reserve_err = sensor_calibration_sensitivity_maintenance_begin();
+	if (reserve_err) {
+		return sensor_operation_result(LED_OWNER_SENS, reserve_err, false);
+	}
+	#endif
+	sys_warm_transaction_begin();
+	k_mutex_lock(&sensitivity_lock, K_FOREVER);
+	bool notify = sensitivity_operation != 0;
+	int err = sys_write(MAIN_GYRO_SENS_ID, &retained->gyroSensScale, scales, sizeof(scales));
+	sensitivity_replace_locked(CAL_REASON_RESET);
+	k_mutex_unlock(&sensitivity_lock);
+	sys_warm_transaction_end(false);
+	#if CONFIG_SENSOR_TCAL_HEATED
+	sensor_calibration_sensitivity_maintenance_end();
+	#endif
+	if (notify) {
+		tracker_events_notify();
+	}
+	return sensor_operation_result(LED_OWNER_SENS, err, true);
+#else
+	return sensor_operation_result(LED_OWNER_SENS, -ENOTSUP, false);
+#endif
+}
+
+#if CONFIG_SENSOR_USE_SENS_CALIBRATION
+
+LOG_MODULE_REGISTER(cal_sens, LOG_LEVEL_INF);
+
+/* Latched by sensor_request_calibration_sens() in calibration.c */
+extern uint8_t sens_cal_axis;
+extern uint16_t sens_cal_revolutions;
+
+// =============================================================================
+// The user spins the tracker a known number of full revolutions about a single
+// axis. We integrate the measured gyro rate over that motion and compare the
+// measured angle against the true angle to derive a per-axis scale factor that
+// corrects cumulative over- or under-rotation.
+#define SENS_CAL_BIAS_SAMPLE_MS 1000    // In-situ bias averaging window
+#define SENS_CAL_REST_RATE_DPS 2.0f     // Discard an untriggered candidate only at rest
+#define SENS_CAL_START_RATE_DPS 30.0f   // Rate that counts as "spin started"
+#define SENS_CAL_STOP_RATE_DPS 10.0f    // Rate that counts as "spin stopped"
+#define SENS_CAL_STOP_DWELL_MS 1000     // Rate must stay low this long to stop
+#define SENS_CAL_START_TIMEOUT_MS 30000 // Give up waiting for the spin to start
+#define SENS_CAL_SPIN_TIMEOUT_MS 60000  // Give up waiting for the spin to finish
+#define SENS_CAL_MIN_FRACTION 0.85f     // Require near-complete expected angle before stopping
+#define SENS_CAL_WARN_OFF_AXIS_RATIO 0.10f
+#define SENS_CAL_MAX_OFF_AXIS_RATIO 0.25f
+
+struct sensitivity_stream {
+	uint32_t sequence;
+	bool started;
+};
+
+static int sensitivity_wait_sample(struct sensor_gyro_sample *sample,
+	struct sensitivity_stream *stream, k_timeout_t timeout)
+{
+	int err = sensor_wait_gyro(sample, timeout);
+	if (err) {
+		return err;
+	}
+	if (!v_finite(sample->v, 3) || !v_finite(&sample->dt, 1) || sample->dt <= 0.0f) {
+		return -EINVAL;
+	}
+	/* Backlog before the bias window is not part of this measurement. Once
+	 * collection starts, every represented interval must remain contiguous. */
+	if (stream->started && sample->sequence != stream->sequence + 1U) {
+		return -EOVERFLOW;
+	}
+	stream->sequence = sample->sequence;
+	stream->started = true;
+	return 0;
+}
+
+void sensor_calibrate_sens(void)
+{
+	const uint16_t operation_id = sensor_calibration_current_operation();
+	const struct led_token feedback = sensor_calibration_current_feedback();
+	const uint32_t collection_generation = sensor_calibration_current_generation();
+	k_mutex_lock(&sensitivity_lock, K_FOREVER);
+	const uint32_t generation = sensitivity_generation;
+	sensitivity_operation = operation_id;
+	sensitivity_feedback = feedback;
+	k_mutex_unlock(&sensitivity_lock);
+	uint8_t axis = sens_cal_axis;
+	uint16_t revolutions = sens_cal_revolutions;
+
+	if (axis > 2 || revolutions == 0) {
+		LOG_ERR("Sensitivity calibration: invalid parameters");
+		printk("Gyro sensitivity auto-calibration failed: invalid parameters.\n");
+		sensitivity_failed(operation_id, feedback, CAL_PHASE_WAIT_STILL, CAL_REASON_INVALID_ARGUMENT);
+		return;
+	}
+	char axis_char = "XYZ"[axis];
+	float expected_deg = 360.0f * revolutions;
+
+	LOG_INF(
+		"Sensitivity calibration: axis %c, %u rev (%.1f deg expected)",
+		axis_char,
+		revolutions,
+		(double)expected_deg
+	);
+
+	struct sensor_gyro_sample sample;
+	struct sensitivity_stream stream = {0};
+
+	// 1. Wait for the tracker to be held still before measuring bias.
+	sensor_calibration_stage(feedback, LED_WAIT_STILL);
+	LOG_INF("Sensitivity calibration: hold still");
+	if (!wait_for_motion(false, 6)) {
+		LOG_WRN("Sensitivity calibration: tracker not still, aborting");
+		printk("Gyro sensitivity auto-calibration failed: tracker was not still.\n");
+		sensitivity_failed(operation_id, feedback, CAL_PHASE_WAIT_STILL, CAL_REASON_MOTION);
+		return;
+	}
+
+	// 2. Measure raw in-situ bias over represented sensor time, not dequeue
+	//    time. Weight by interval so a changing sample period remains correct.
+	sensitivity_step(operation_id, feedback, CAL_PHASE_COLLECT, 0);
+	double bias_sum[3] = {0.0, 0.0, 0.0};
+	double bias_time = 0.0; // Bounded by the one-second collection window.
+	while (bias_time < SENS_CAL_BIAS_SAMPLE_MS * 1e-3) {
+		if (sensitivity_wait_sample(&sample, &stream, K_MSEC(1000))) {
+			LOG_WRN("Sensitivity calibration: missing or invalid gyro interval during bias");
+			printk("Gyro sensitivity auto-calibration failed: missing or invalid bias interval.\n");
+			sensitivity_failed(operation_id, feedback, CAL_PHASE_COLLECT, CAL_REASON_INSUFFICIENT_SAMPLES);
+			return;
+		}
+		double sample_dt = (double)sample.dt;
+		for (int i = 0; i < 3; i++) {
+			bias_sum[i] += (double)sample.v[i] * sample_dt;
+		}
+		bias_time += sample_dt;
+		watchdog_feed(WDT_CHANNEL_CALIBRATION);
+	}
+	float gyro_bias[3];
+	for (int i = 0; i < 3; i++) {
+		gyro_bias[i] = (float)(bias_sum[i] / bias_time);
+	}
+	LOG_INF(
+		"Sensitivity calibration: bias %.4f %.4f %.4f dps",
+		(double)gyro_bias[0],
+		(double)gyro_bias[1],
+		(double)gyro_bias[2]
+	);
+
+	if (feedback.session) {
+		k_mutex_lock(&sensitivity_lock, K_FOREVER);
+		if (generation == sensitivity_generation && sensor_calibration_generation_valid(collection_generation)) {
+			sensor_calibration_result(feedback, LED_STAGE_ACK);
+		}
+		k_mutex_unlock(&sensitivity_lock);
+	}
+
+	// Preserve the whole contiguous motion candidate, including a slow ramp
+	// before the start threshold. Only pretrigger rest discards a candidate.
+	LOG_INF("Sensitivity calibration: spin the tracker about the %c axis now", axis_char);
+	sensitivity_step(operation_id, feedback, CAL_PHASE_WAIT_ROTATION, axis);
+	int64_t arm_start = k_uptime_get();
+	int64_t last_wdt = arm_start;
+	int64_t spin_start = 0;
+	double measured = 0.0;
+	double axis_motion = 0.0;
+	double off_axis_motion = 0.0;
+	double below_time = 0.0; // Only the current stop-dwell window.
+	bool recording = false;
+	bool finished = false;
+	while (true) {
+		if (!recording && k_uptime_get() - arm_start >= SENS_CAL_START_TIMEOUT_MS) {
+			LOG_WRN("Sensitivity calibration: no spin detected, aborting");
+			printk("Gyro sensitivity auto-calibration failed: no spin detected.\n");
+			sensitivity_failed(operation_id, feedback, CAL_PHASE_WAIT_ROTATION, CAL_REASON_START_TIMEOUT);
+			return;
+		}
+		if (recording && k_uptime_get() - spin_start >= SENS_CAL_SPIN_TIMEOUT_MS) {
+			break;
+		}
+		int err = sensitivity_wait_sample(&sample, &stream, K_MSEC(1000));
+		if (err) {
+			if (recording) {
+				LOG_WRN("Sensitivity calibration: missing or invalid gyro interval, aborting");
+				printk("Gyro sensitivity auto-calibration failed: missing or invalid gyro interval.\n");
+				sensitivity_failed(operation_id, feedback, CAL_PHASE_RECORD_ROTATION, CAL_REASON_INSUFFICIENT_SAMPLES);
+				return;
+			}
+			if (err == -EOVERFLOW || err == -EINVAL) {
+				sensitivity_failed(operation_id, feedback, CAL_PHASE_WAIT_ROTATION, CAL_REASON_INSUFFICIENT_SAMPLES);
+				return;
+			}
+			continue; // Wall-clock timeout still bounds a missing stream.
+		}
+		if (recording && k_uptime_get() - spin_start >= SENS_CAL_SPIN_TIMEOUT_MS) {
+			break;
+		}
+		float rate = sample.v[axis] - gyro_bias[axis];
+		if (k_uptime_get() - last_wdt >= 1000) {
+			watchdog_feed(WDT_CHANNEL_CALIBRATION);
+			last_wdt = k_uptime_get();
+		}
+		if (!recording) {
+			if (fabsf(rate) < SENS_CAL_REST_RATE_DPS) {
+				measured = 0.0;
+				axis_motion = 0.0;
+				off_axis_motion = 0.0;
+				continue;
+			}
+			if (fabsf(rate) > SENS_CAL_START_RATE_DPS) {
+				LOG_INF("Sensitivity calibration: recording");
+				sensitivity_step(operation_id, feedback, CAL_PHASE_RECORD_ROTATION, axis);
+				recording = true;
+				spin_start = k_uptime_get();
+				last_wdt = spin_start;
+			}
+		}
+
+		// Every represented interval, including the trigger, is integrated once.
+		double dt = sample.dt;
+		measured += (double)rate * dt;
+		axis_motion += fabs((double)rate) * dt;
+		double off_axis_rate_sq = 0.0;
+		for (int i = 0; i < 3; i++) {
+			if (i != axis) {
+				double off_rate = (double)(sample.v[i] - gyro_bias[i]);
+				off_axis_rate_sq += off_rate * off_rate;
+			}
+		}
+		off_axis_motion += sqrt(off_axis_rate_sq) * dt;
+
+		if (!recording) {
+			continue;
+		}
+
+		// The spin is complete once the rate stays low for the dwell time, but only
+		// after at least a minimum fraction of the expected angle has been covered.
+		// This keeps a brief pause mid-spin from ending the measurement early.
+		if (fabsf(rate) < SENS_CAL_STOP_RATE_DPS && fabs(measured) >= (double)(expected_deg * SENS_CAL_MIN_FRACTION)) {
+			below_time += dt;
+			if (below_time >= SENS_CAL_STOP_DWELL_MS * 1e-3) {
+				finished = true;
+				break;
+			}
+		} else {
+			below_time = 0.0;
+		}
+	}
+
+	if (!finished) {
+		LOG_WRN("Sensitivity calibration: spin did not complete in time, aborting");
+		printk("Gyro sensitivity auto-calibration failed: spin did not complete in time.\n");
+		sensitivity_failed(operation_id, feedback, CAL_PHASE_RECORD_ROTATION, CAL_REASON_RECORD_TIMEOUT);
+		return;
+	}
+
+	sensitivity_step(operation_id, feedback, CAL_PHASE_VALIDATE, 0);
+	float measured_deg = (float)fabs(measured);
+
+	// Want measured_deg * scale == expected_deg, independent of rotation direction.
+	float scale = expected_deg / measured_deg;
+	float over_rotation = measured_deg - expected_deg;
+	float off_axis_ratio = axis_motion > 1e-3 ? (float)(off_axis_motion / axis_motion) : 1.0f;
+	float equivalent_diff_deg = (1.0f - (1.0f / scale)) * (360.0f * CONFIG_SENSOR_SENS_REV);
+	LOG_INF(
+		"Sensitivity calibration: measured %.2f deg, expected %.2f deg, over-rotation %.2f deg, off-axis %.3f",
+		(double)measured_deg,
+		(double)expected_deg,
+		(double)over_rotation,
+		(double)off_axis_ratio
+	);
+	LOG_INF("Sensitivity calibration: computed scale %.5f", (double)scale);
+
+	if (!sensor_calibration_sensitivity_valid(scale)) {
+		LOG_WRN("Sensitivity calibration: computed invalid scale, not applied");
+		printk("Gyro sensitivity auto-calibration rejected: scale outside 0.9..1.1. Nothing saved.\n");
+		sensitivity_failed(operation_id, feedback, CAL_PHASE_VALIDATE, CAL_REASON_INVALID_MODEL);
+		return;
+	}
+
+	if (off_axis_ratio > SENS_CAL_MAX_OFF_AXIS_RATIO) {
+		LOG_WRN(
+			"Sensitivity calibration: off-axis ratio %.3f above %.3f, not applied",
+			(double)off_axis_ratio,
+			(double)SENS_CAL_MAX_OFF_AXIS_RATIO
+		);
+		printk(
+			"Gyro sensitivity auto-calibration rejected: too much off-axis motion (%.2f > %.2f). Nothing saved.\n",
+			(double)off_axis_ratio,
+			(double)SENS_CAL_MAX_OFF_AXIS_RATIO
+		);
+		sensitivity_failed(operation_id, feedback, CAL_PHASE_VALIDATE, CAL_REASON_QUALITY);
+		return;
+	}
+
+	sys_warm_transaction_begin();
+	k_mutex_lock(&sensitivity_lock, K_FOREVER);
+	if (generation != sensitivity_generation || !sensor_calibration_generation_valid(collection_generation)) {
+		bool cancelled = !sensor_calibration_generation_valid(collection_generation);
+		k_mutex_unlock(&sensitivity_lock);
+		sys_warm_transaction_end(false);
+		if (cancelled) {
+			cal_event_end(operation_id, CAL_OUTCOME_CANCELLED, CAL_PHASE_APPLY_PENDING, CAL_REASON_RESET);
+			sensor_calibration_result(feedback, LED_CANCELLED);
+			tracker_events_notify();
+		}
+		return;
+	}
+	retained->gyroSensScale[axis] = scale;
+	sensitivity_generation++;
+	cal_event_end(operation_id, CAL_OUTCOME_SUCCESS, CAL_PHASE_APPLIED, CAL_REASON_NONE);
+	sensitivity_operation = 0;
+	sensitivity_feedback = (struct led_token){0};
+	retained_update();
+	int storage_err = sys_write(MAIN_GYRO_SENS_ID, &retained->gyroSensScale,
+				    retained->gyroSensScale, sizeof(retained->gyroSensScale));
+	if (storage_err < 0) {
+		cal_event_step(operation_id, CAL_PHASE_STORAGE, CAL_REASON_STORAGE_ERROR);
+	}
+	k_mutex_unlock(&sensitivity_lock);
+	sys_warm_transaction_end(false);
+	sensor_calibration_result(feedback, storage_err < 0 ? LED_APPLIED_NOT_SAVED : LED_SUCCESS);
+	if (operation_id) {
+		tracker_events_notify();
+	}
+
+	LOG_INF("Sensitivity calibration: axis %c scale set to %.5f", axis_char, (double)scale);
+	if (off_axis_ratio > SENS_CAL_WARN_OFF_AXIS_RATIO) {
+		printk(
+			"Gyro sensitivity auto-calibration applied: axis %c, scale %.5f, equivalent sens diff over %u rev: %.3f deg, "
+			"off-axis %.2f. Axis alignment was loose; repeating may improve accuracy.\n",
+			axis_char,
+			(double)scale,
+			(unsigned int)CONFIG_SENSOR_SENS_REV,
+			(double)equivalent_diff_deg,
+			(double)off_axis_ratio
+		);
+	} else {
+		printk(
+			"Gyro sensitivity auto-calibration applied: axis %c, scale %.5f, equivalent sens diff over %u rev: %.3f deg, "
+			"off-axis %.2f.\n",
+			axis_char,
+			(double)scale,
+			(unsigned int)CONFIG_SENSOR_SENS_REV,
+			(double)equivalent_diff_deg,
+			(double)off_axis_ratio
+		);
+	}
+	if (storage_err < 0) {
+		LOG_ERR("Sensitivity calibration applied in RAM; persistence failed: %d", storage_err);
+	}
+}
+
+#endif /* CONFIG_SENSOR_USE_SENS_CALIBRATION */

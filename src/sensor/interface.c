@@ -1,0 +1,659 @@
+#include "interface_internal.h"
+
+#include <zephyr/logging/log.h>
+
+#include <errno.h>
+#include <string.h>
+
+//#define DEBUG true
+//#define DEBUG_RATE true
+
+#if DEBUG || DEBUG_RATE
+LOG_MODULE_REGISTER(sensor_interface, LOG_LEVEL_DBG);
+#else
+LOG_MODULE_REGISTER(sensor_interface, LOG_LEVEL_INF);
+#endif
+
+// TODO: move all sensor devices here? currently they are scanned by sensor loop
+
+struct spi_dt_spec *sensor_interface_dev_spi[SENSOR_INTERFACE_DEV_COUNT];
+struct i2c_dt_spec *sensor_interface_dev_i2c[SENSOR_INTERFACE_DEV_COUNT];
+enum sensor_interface_spec sensor_interface_dev_spec[SENSOR_INTERFACE_DEV_COUNT];
+
+uint32_t sensor_interface_dev_spi_dummy_reads[SENSOR_INTERFACE_DEV_COUNT] = {0};
+
+#if CONFIG_SENSOR_USE_MAGNETOMETER
+uint8_t ext_addr = 0x00;
+static const sensor_ext_ssi_t *ext_ssi = NULL;
+#endif
+
+static int ssi_report_error(enum sensor_interface_dev dev, const char *operation, int reg, int err)
+{
+	if (!err || err == -EAGAIN)
+		return err;
+
+	const char *device = dev == SENSOR_INTERFACE_DEV_IMU ? "IMU" : "unknown";
+	const char *bus = "unknown";
+	const char *controller = "unknown";
+	int address = -1;
+	int spec_type = (unsigned)dev >= SENSOR_INTERFACE_DEV_COUNT ?
+		-1 : (int)sensor_interface_dev_spec[dev];
+
+#if CONFIG_SENSOR_USE_MAGNETOMETER
+	if (dev == SENSOR_INTERFACE_DEV_MAG)
+		device = "MAG";
+	bool external = spec_type == SENSOR_INTERFACE_SPEC_EXT;
+	if (external)
+	{
+		dev = SENSOR_INTERFACE_DEV_IMU;
+		spec_type = sensor_interface_dev_spec[dev];
+	}
+#endif
+	switch (spec_type)
+	{
+	case SENSOR_INTERFACE_SPEC_SPI:
+		bus = "SPI";
+		if (sensor_interface_dev_spi[dev] != NULL)
+		{
+			const struct spi_dt_spec *spec = sensor_interface_dev_spi[dev];
+			if (spec->bus != NULL)
+				controller = spec->bus->name;
+			address = spec->config.slave;
+		}
+		break;
+	case SENSOR_INTERFACE_SPEC_I2C:
+		bus = "I2C";
+		if (sensor_interface_dev_i2c[dev] != NULL)
+		{
+			const struct i2c_dt_spec *spec = sensor_interface_dev_i2c[dev];
+			if (spec->bus != NULL)
+				controller = spec->bus->name;
+			address = spec->addr;
+		}
+		break;
+	default:
+		break;
+	}
+#if CONFIG_SENSOR_USE_MAGNETOMETER
+	if (external)
+	{
+		bus = "EXT";
+		address = ext_addr;
+	}
+#endif
+
+	LOG_ERR("SSI %s dev=%s bus=%s controller=%s addr=%d reg=%d err=%d",
+		operation, device, bus, controller, address, reg, err);
+	return err;
+}
+
+// TODO: only one active spi transaction at a time
+// TODO: spi burst read multiple buffers
+
+uint8_t rx_tmp[8] = {0};
+struct spi_buf tx_bufs[2];
+struct spi_buf_set tx = {.buffers = tx_bufs, .count = 1};
+struct spi_buf rx_bufs[2];
+struct spi_buf_set rx = {.buffers = rx_bufs, .count = 2};
+
+#if CONFIG_SENSOR_USE_MAGNETOMETER
+// TODO: also keep reference to sensor device drivers (such as for ext mag)
+
+static int ssi_ext_read_segmented(uint8_t start_addr, uint8_t dummy_bytes, uint8_t word_bytes, uint8_t *buf, uint32_t num_bytes)
+{
+	if (ext_ssi == NULL)
+		return -1;
+
+	uint8_t data_cap = ext_ssi->ext_burst;
+	if (dummy_bytes && ext_ssi->ext_single_burst)
+		data_cap = ext_ssi->ext_single_burst;
+	if (data_cap == 0)
+		return -1;
+	/* A per-chunk dummy prefix is consumed by the IMU driver before the data,
+	 * so it reduces the data bytes that fit in one transaction. */
+	if (dummy_bytes >= data_cap)
+		return -1;
+
+	uint8_t data_per_chunk = (data_cap - dummy_bytes) / word_bytes * word_bytes;
+	if (data_per_chunk == 0)
+		return -1;
+	size_t offset = 0;
+	while (offset < num_bytes)
+	{
+		size_t chunk = num_bytes - offset;
+		if (chunk > data_per_chunk)
+			chunk = data_per_chunk;
+
+		/* The interface layer advances the sub-register by the number of data
+		 * bytes already read, matching how a single auto-incrementing burst
+		 * would walk the register map. dummy_bytes are dropped inside the
+		 * driver read; here we must skip them before copying data out. */
+		uint8_t reg = start_addr + (uint8_t)offset;
+		if (dummy_bytes)
+		{
+			uint8_t tmp[32]; /* holds dummy prefix + one chunk of register data */
+			int err = ext_ssi->ext_write_read(ext_addr, &reg, 1, tmp, dummy_bytes + chunk);
+			if (err)
+				return err;
+			memcpy(buf + offset, tmp + dummy_bytes, chunk);
+		}
+		else
+		{
+			int err = ext_ssi->ext_write_read(ext_addr, &reg, 1, buf + offset, chunk);
+			if (err)
+				return err;
+		}
+		offset += chunk;
+	}
+	return 0;
+}
+#endif
+
+void sensor_interface_register_sensor_imu_spi(struct spi_dt_spec *dev)
+{
+	sensor_interface_dev_spi[SENSOR_INTERFACE_DEV_IMU] = dev;
+	sensor_interface_dev_spec[SENSOR_INTERFACE_DEV_IMU] = SENSOR_INTERFACE_SPEC_SPI;
+}
+
+void sensor_interface_register_sensor_imu_i2c(struct i2c_dt_spec *dev)
+{
+	sensor_interface_dev_i2c[SENSOR_INTERFACE_DEV_IMU] = dev;
+	sensor_interface_dev_spec[SENSOR_INTERFACE_DEV_IMU] = SENSOR_INTERFACE_SPEC_I2C;
+}
+
+bool sensor_interface_imu_is_i2c(void)
+{
+	return sensor_interface_dev_spec[SENSOR_INTERFACE_DEV_IMU] == SENSOR_INTERFACE_SPEC_I2C;
+}
+
+#if CONFIG_SENSOR_USE_MAGNETOMETER
+void sensor_interface_register_sensor_mag_spi(struct spi_dt_spec *dev)
+{
+	sensor_interface_dev_spi[SENSOR_INTERFACE_DEV_MAG] = dev;
+	sensor_interface_dev_spec[SENSOR_INTERFACE_DEV_MAG] = SENSOR_INTERFACE_SPEC_SPI;
+}
+
+void sensor_interface_register_sensor_mag_i2c(struct i2c_dt_spec *dev) // also used for passthrough
+{
+	sensor_interface_dev_i2c[SENSOR_INTERFACE_DEV_MAG] = dev;
+	sensor_interface_dev_spec[SENSOR_INTERFACE_DEV_MAG] = SENSOR_INTERFACE_SPEC_I2C;
+}
+
+int sensor_interface_register_sensor_mag_ext(uint8_t addr, uint8_t min_burst, uint8_t burst)
+{
+	switch (sensor_interface_dev_spec[SENSOR_INTERFACE_DEV_IMU])
+	{
+	case SENSOR_INTERFACE_SPEC_SPI:
+		if (ext_ssi != NULL)
+		{
+			/* Only a single read whose register-data length cannot be segmented
+			 * below the I2CM transaction width is unsupported. Anything wider is
+			 * segmented transparently by the interface layer. */
+			if (min_burst > ext_ssi->ext_burst)
+			{
+				LOG_ERR("Unsupported minimum burst %u > external read width %u", min_burst, ext_ssi->ext_burst);
+				return -1;
+			}
+			if (burst > ext_ssi->ext_burst)
+				LOG_INF("Magnetometer burst %u exceeds I2CM width %u; using segmented external reads", burst, ext_ssi->ext_burst);
+			ext_addr = addr;
+			sensor_interface_dev_spec[SENSOR_INTERFACE_DEV_MAG] = SENSOR_INTERFACE_SPEC_EXT;
+			return 0;
+		}
+		else
+		{
+			LOG_ERR("IMU must configure external interface before registering magnetometer");
+			return -1;
+		}
+		break;
+	case SENSOR_INTERFACE_SPEC_I2C:
+		LOG_ERR("External interface not used over I2C");
+		return -1;
+	default:
+		LOG_ERR("IMU must be registered before registering magnetometer");
+	}
+	return -1;
+}
+#endif
+
+// must be called to set correct frequency
+int sensor_interface_spi_configure(enum sensor_interface_dev dev, uint32_t frequency, uint32_t dummy_reads)
+{
+	if (sensor_interface_dev_spec[dev] != SENSOR_INTERFACE_SPEC_SPI)
+		return -1; // no spi device registered
+#if DT_NODE_HAS_COMPAT(DT_BUS(DT_NODELABEL(imu_spi)), zephyr_spi_bitbang)
+	/* Unlike nrfx SPIM, bitbang does not enforce a controller frequency cap. */
+	if (dev == SENSOR_INTERFACE_DEV_IMU)
+		frequency = MIN(frequency, DT_PROP(DT_NODELABEL(imu_spi), spi_max_frequency));
+#endif
+	sensor_interface_dev_spi[dev]->config.frequency = frequency;
+	sensor_interface_dev_spi_dummy_reads[dev] = dummy_reads;
+	return 0;
+}
+
+#if CONFIG_SENSOR_USE_MAGNETOMETER
+void sensor_interface_ext_configure(const sensor_ext_ssi_t *ext)
+{
+	ext_ssi = ext;
+}
+
+const sensor_ext_ssi_t *sensor_interface_ext_get(void)
+{
+	return ext_ssi;
+}
+
+int sensor_interface_ext_set_prefetch(bool enabled)
+{
+	if (sensor_interface_dev_spec[SENSOR_INTERFACE_DEV_MAG] != SENSOR_INTERFACE_SPEC_EXT)
+		return 0;
+	int err = ext_ssi == NULL ? -1 :
+		(ext_ssi->ext_set_prefetch ? ext_ssi->ext_set_prefetch(enabled) : 0);
+	return ssi_report_error(SENSOR_INTERFACE_DEV_MAG, "prefetch", -1, err);
+}
+
+bool sensor_interface_mag_free_running(void)
+{
+	return sensor_interface_dev_spec[SENSOR_INTERFACE_DEV_MAG] == SENSOR_INTERFACE_SPEC_EXT && ext_ssi != NULL
+		&& ext_ssi->ext_free_running;
+}
+
+bool sensor_interface_mag_frame_ready(void)
+{
+	return sensor_interface_dev_spec[SENSOR_INTERFACE_DEV_MAG] == SENSOR_INTERFACE_SPEC_EXT && ext_ssi != NULL
+		&& ext_ssi->ext_read_frame != NULL && ext_ssi->ext_frame_ready != NULL && ext_ssi->ext_frame_ready();
+}
+#endif
+
+enum sensor_interface_spec sensor_interface_get_spec(enum sensor_interface_dev dev)
+{
+	if ((unsigned)dev >= SENSOR_INTERFACE_DEV_COUNT)
+		return SENSOR_INTERFACE_SPEC_SPI; // safe default
+	return sensor_interface_dev_spec[dev];
+}
+
+// TODO: spi config by device
+
+static int ssi_write_unreported(enum sensor_interface_dev dev, const uint8_t *buf, uint32_t num_bytes)
+{
+	switch (sensor_interface_dev_spec[dev])
+	{
+	case SENSOR_INTERFACE_SPEC_SPI:
+		tx_bufs[0].buf = (void *)buf;
+		tx_bufs[0].len = num_bytes;
+		tx.count = 1;
+#if DEBUG
+		LOG_DBG("ssi_write: dev=%d, num_bytes=%zu", dev, num_bytes);
+		LOG_HEXDUMP_DBG(buf, num_bytes, "ssi_write: buf");
+		int err = spi_transceive_dt(sensor_interface_dev_spi[dev], &tx, NULL);
+		LOG_DBG("ssi_write: err=%d", err);
+		k_msleep(500);
+		return err;
+#elif DEBUG_RATE
+		int64_t start = k_uptime_ticks();
+		int err = spi_transceive_dt(sensor_interface_dev_spi[dev], &tx, NULL);
+		int64_t end = k_uptime_ticks();
+		printk("ssi_write: %zuB, %.2f MB/s\n", num_bytes, (double)num_bytes / (double)k_ticks_to_us_near64(end - start));
+		return err;
+#else
+		return spi_transceive_dt(sensor_interface_dev_spi[dev], &tx, NULL);
+#endif
+	case SENSOR_INTERFACE_SPEC_I2C:
+		return i2c_write_dt(sensor_interface_dev_i2c[dev], buf, num_bytes);
+#if CONFIG_SENSOR_USE_MAGNETOMETER
+	case SENSOR_INTERFACE_SPEC_EXT:
+		if (ext_ssi != NULL)
+			return ext_ssi->ext_write(ext_addr, buf, num_bytes);
+		else
+			return -1;
+#endif
+	default:
+		return -1;
+	}
+}
+
+int ssi_write(enum sensor_interface_dev dev, const uint8_t *buf, uint32_t num_bytes)
+{
+	int err = ssi_write_unreported(dev, buf, num_bytes);
+	return ssi_report_error(dev, "write", -1, err);
+}
+
+static int ssi_read_unreported(enum sensor_interface_dev dev, uint8_t *buf, uint32_t num_bytes)
+{
+	switch (sensor_interface_dev_spec[dev])
+	{
+	case SENSOR_INTERFACE_SPEC_SPI:
+		// TODO: this may be zero!
+		rx_bufs[0].buf = rx_tmp;
+		rx_bufs[0].len = sensor_interface_dev_spi_dummy_reads[dev];
+		rx_bufs[1].buf = buf;
+		rx_bufs[1].len = num_bytes;
+		rx.count = 2;
+#if DEBUG
+		LOG_DBG("ssi_read: dev=%d, num_bytes=%zu", dev, num_bytes);
+		int err = spi_transceive_dt(sensor_interface_dev_spi[dev], NULL, &rx);
+		LOG_HEXDUMP_DBG(rx_tmp, sensor_interface_dev_spi_dummy_reads[dev], "ssi_read: rx_tmp");
+		LOG_HEXDUMP_DBG(buf, num_bytes, "ssi_read: buf");
+		LOG_DBG("ssi_read: err=%d", err);
+		k_msleep(500);
+		return err;
+#elif DEBUG_RATE
+		int64_t start = k_uptime_ticks();
+		int err = spi_transceive_dt(sensor_interface_dev_spi[dev], NULL, &rx);
+		int64_t end = k_uptime_ticks();
+		printk("ssi_read: %zuB, %.2f MB/s\n", num_bytes, (double)num_bytes / (double)k_ticks_to_us_near64(end - start));
+		return err;
+#else
+		return spi_transceive_dt(sensor_interface_dev_spi[dev], NULL, &rx);
+#endif
+	case SENSOR_INTERFACE_SPEC_I2C:
+		return i2c_read_dt(sensor_interface_dev_i2c[dev], buf, num_bytes);
+	default:
+		return -1;
+	}
+}
+
+int ssi_read(enum sensor_interface_dev dev, uint8_t *buf, uint32_t num_bytes)
+{
+	int err = ssi_read_unreported(dev, buf, num_bytes);
+	return ssi_report_error(dev, "read", -1, err);
+}
+
+static int ssi_write_read_unreported(enum sensor_interface_dev dev, const void *write_buf, size_t num_write, void *read_buf, size_t num_read)
+{
+	// TODO: is separate read/write better for spi?
+	switch (sensor_interface_dev_spec[dev])
+	{
+	case SENSOR_INTERFACE_SPEC_SPI:
+		tx_bufs[0].buf = (void *)write_buf;
+		tx_bufs[0].len = num_write;
+		tx.count = 1;
+		rx_bufs[0].buf = rx_tmp;
+		rx_bufs[0].len = num_write + sensor_interface_dev_spi_dummy_reads[dev];
+		rx_bufs[1].buf = read_buf;
+		rx_bufs[1].len = num_read;
+		rx.count = 2;
+#if DEBUG
+		LOG_DBG("ssi_write_read: dev=%d, num_write=%zu, num_read=%zu", dev, num_write, num_read);
+		LOG_HEXDUMP_DBG(write_buf, num_write, "ssi_write_read: write_buf");
+		int err = spi_transceive_dt(sensor_interface_dev_spi[dev], &tx, &rx);
+		LOG_HEXDUMP_DBG(rx_tmp, num_write + sensor_interface_dev_spi_dummy_reads[dev], "ssi_write_read: rx_tmp");
+		LOG_HEXDUMP_DBG(read_buf, num_read, "ssi_write_read: read_buf");
+		LOG_DBG("ssi_write_read: err=%d", err);
+		k_msleep(500);
+		return err;
+#elif DEBUG_RATE
+		int64_t start = k_uptime_ticks();
+		int err = spi_transceive_dt(sensor_interface_dev_spi[dev], &tx, &rx);
+		int64_t end = k_uptime_ticks();
+		printk("ssi_write_read: %zuB, %.2f MB/s\n", (num_write + num_read), (double)(num_write + num_read) / (double)k_ticks_to_us_near64(end - start));
+		return err;
+#else
+		return spi_transceive_dt(sensor_interface_dev_spi[dev], &tx, &rx);
+#endif
+	case SENSOR_INTERFACE_SPEC_I2C:
+		return i2c_write_read_dt(sensor_interface_dev_i2c[dev], write_buf, num_write, read_buf, num_read);
+#if CONFIG_SENSOR_USE_MAGNETOMETER
+	case SENSOR_INTERFACE_SPEC_EXT:
+		if (ext_ssi == NULL)
+			return -1;
+		if (num_write != 1)
+			return -1;
+		if (num_read <= ext_ssi->ext_burst)
+			return ext_ssi->ext_write_read(ext_addr, write_buf, num_write, read_buf, num_read);
+		/* Longer than one I2CM transaction: segment by register-data length. */
+		return ssi_ext_read_segmented(((const uint8_t *)write_buf)[0], 0, 1, read_buf, num_read);
+#endif
+	default:
+		return -1;
+	}
+}
+
+int ssi_write_read(enum sensor_interface_dev dev, const void *write_buf, size_t num_write, void *read_buf, size_t num_read)
+{
+	int reg = num_write == 1 && write_buf != NULL ? *(const uint8_t *)write_buf : -1;
+	int err = ssi_write_read_unreported(dev, write_buf, num_write, read_buf, num_read);
+	return ssi_report_error(dev, "write_read", reg, err);
+}
+
+int ssi_burst_read_io(enum sensor_interface_dev dev, uint8_t start_addr, uint8_t *buf, uint32_t num_bytes, enum ssi_reporting reporting)
+{
+	uint8_t reg = start_addr;
+	if (sensor_interface_dev_spec[dev] == SENSOR_INTERFACE_SPEC_SPI)
+		start_addr |= 0x80; // set read bit
+	int err = ssi_write_read_unreported(dev, &start_addr, 1, buf, num_bytes);
+	return reporting == SSI_REPORT ? ssi_report_error(dev, "burst_read", reg, err) : err;
+}
+
+int ssi_burst_read(enum sensor_interface_dev dev, uint8_t start_addr, uint8_t *buf, uint32_t num_bytes)
+{
+	return ssi_burst_read_io(dev, start_addr, buf, num_bytes, SSI_REPORT);
+}
+
+static int ssi_burst_read_words(enum sensor_interface_dev dev, uint8_t start_addr, uint8_t dummy_bytes, uint8_t word_bytes, uint8_t *buf, uint32_t num_bytes)
+{
+	if (word_bytes == 0)
+		return -EINVAL;
+
+#if CONFIG_SENSOR_USE_MAGNETOMETER
+	/* On the external (I2CM) interface the interface layer owns segmentation:
+	 * it advances the sub-register per data chunk and strips the per-chunk
+	 * dummy prefix, so >burst register reads are merged transparently. */
+	if (sensor_interface_dev_spec[dev] == SENSOR_INTERFACE_SPEC_EXT)
+		return ssi_ext_read_segmented(start_addr, dummy_bytes, word_bytes, buf, num_bytes);
+#endif
+	if (dummy_bytes == 0)
+		return ssi_burst_read_io(dev, start_addr, buf, num_bytes, SSI_UNREPORTED);
+
+	uint8_t tmp[16];
+	if (dummy_bytes >= sizeof(tmp))
+		return -1;
+	uint32_t max_chunk = (sizeof(tmp) - dummy_bytes) / word_bytes * word_bytes;
+	if (max_chunk == 0)
+		return -1;
+	uint32_t offset = 0;
+	while (offset < num_bytes)
+	{
+		// Each segment has its own dummy prefix, so only bytes after the prefix are copied out.
+		uint32_t chunk = num_bytes - offset;
+		if (chunk > max_chunk)
+			chunk = max_chunk;
+		int err = ssi_burst_read_io(dev, start_addr + offset, tmp, dummy_bytes + chunk, SSI_UNREPORTED);
+		if (err)
+			return err;
+		memcpy(buf + offset, tmp + dummy_bytes, chunk);
+		offset += chunk;
+	}
+
+	return 0;
+}
+
+int ssi_burst_read_dummy(enum sensor_interface_dev dev, uint8_t start_addr, uint8_t dummy_bytes, uint8_t *buf, uint32_t num_bytes)
+{
+	return ssi_report_error(dev, "burst_read_dummy", start_addr,
+				ssi_burst_read_words(dev, start_addr, dummy_bytes, 1, buf, num_bytes));
+}
+
+int ssi_burst_read_frame(enum sensor_interface_dev dev, uint8_t start_addr, uint8_t dummy_bytes, uint8_t word_bytes, uint8_t *buf, uint32_t num_bytes)
+{
+#if CONFIG_SENSOR_USE_MAGNETOMETER
+	if (sensor_interface_dev_spec[dev] == SENSOR_INTERFACE_SPEC_EXT && ext_ssi != NULL && ext_ssi->ext_read_frame != NULL
+	    && word_bytes != 0 && num_bytes <= UINT8_MAX)
+	{
+		int err = ext_ssi->ext_read_frame(ext_addr, start_addr, dummy_bytes, word_bytes, buf, num_bytes);
+		if (err != -E2BIG)
+			return ssi_report_error(dev, "burst_read_frame", start_addr, err);
+	}
+#endif
+	return ssi_report_error(dev, "burst_read_frame", start_addr,
+				ssi_burst_read_words(dev, start_addr, dummy_bytes, word_bytes, buf, num_bytes));
+}
+
+static int ssi_burst_write_unreported(enum sensor_interface_dev dev, uint8_t start_addr, const uint8_t *buf, uint32_t num_bytes)
+{
+	switch (sensor_interface_dev_spec[dev])
+	{
+	case SENSOR_INTERFACE_SPEC_SPI:
+		tx_bufs[0].buf = &start_addr;
+		tx_bufs[0].len = 1;
+		tx_bufs[1].buf = (void *)buf;
+		tx_bufs[1].len = num_bytes;
+		tx.count = 2;
+#if DEBUG
+		LOG_DBG("ssi_burst_write: dev=%d, start_addr=0x%02X, num_bytes=%d", dev, start_addr, num_bytes);
+		LOG_HEXDUMP_DBG(&start_addr, 1, "ssi_burst_write: start_addr");
+		LOG_HEXDUMP_DBG(buf, num_bytes, "ssi_burst_write: buf");
+		int err = spi_transceive_dt(sensor_interface_dev_spi[dev], &tx, NULL);
+		LOG_DBG("ssi_burst_write: err=%d", err);
+		k_msleep(500);
+		return err;
+#elif DEBUG_RATE
+		int64_t start = k_uptime_ticks();
+		int err = spi_transceive_dt(sensor_interface_dev_spi[dev], &tx, NULL);
+		int64_t end = k_uptime_ticks();
+		printk("ssi_burst_write: %zuB, %.2f MB/s\n", num_bytes, (double)num_bytes / (double)k_ticks_to_us_near64(end - start));
+		return err;
+#else
+		return spi_transceive_dt(sensor_interface_dev_spi[dev], &tx, NULL);
+#endif
+	case SENSOR_INTERFACE_SPEC_I2C:
+		return i2c_burst_write_dt(sensor_interface_dev_i2c[dev], start_addr, buf, num_bytes);
+	default:
+		return -1;
+	}
+}
+
+int ssi_burst_write_io(enum sensor_interface_dev dev, uint8_t start_addr, const uint8_t *buf, uint32_t num_bytes, enum ssi_reporting reporting)
+{
+	int err = ssi_burst_write_unreported(dev, start_addr, buf, num_bytes);
+	return reporting == SSI_REPORT ? ssi_report_error(dev, "burst_write", start_addr, err) : err;
+}
+
+int ssi_burst_write(enum sensor_interface_dev dev, uint8_t start_addr, const uint8_t *buf, uint32_t num_bytes)
+{
+	return ssi_burst_write_io(dev, start_addr, buf, num_bytes, SSI_REPORT);
+}
+
+int ssi_reg_read_byte_io(enum sensor_interface_dev dev, uint8_t reg_addr, uint8_t *value, enum ssi_reporting reporting)
+{
+	uint8_t reg = reg_addr;
+	if (sensor_interface_dev_spec[dev] == SENSOR_INTERFACE_SPEC_SPI)
+		reg_addr |= 0x80; // set read bit
+	int err = ssi_write_read_unreported(dev, &reg_addr, 1, value, 1);
+	return reporting == SSI_REPORT ? ssi_report_error(dev, "reg_read", reg, err) : err;
+}
+
+int ssi_reg_read_byte(enum sensor_interface_dev dev, uint8_t reg_addr, uint8_t *value)
+{
+	return ssi_reg_read_byte_io(dev, reg_addr, value, SSI_REPORT);
+}
+
+int ssi_reg_write_byte_io(enum sensor_interface_dev dev, uint8_t reg_addr, uint8_t value, enum ssi_reporting reporting)
+{
+	uint8_t buf[2] = {reg_addr, value};
+	int err = ssi_write_unreported(dev, buf, 2);
+	return reporting == SSI_REPORT ? ssi_report_error(dev, "reg_write", reg_addr, err) : err;
+}
+
+int ssi_reg_write_byte(enum sensor_interface_dev dev, uint8_t reg_addr, uint8_t value)
+{
+	return ssi_reg_write_byte_io(dev, reg_addr, value, SSI_REPORT);
+}
+
+int ssi_reg_update_byte(enum sensor_interface_dev dev, uint8_t reg_addr, uint8_t mask, uint8_t value)
+{
+	uint8_t old_value, new_value;
+	uint8_t requested_reg = reg_addr;
+	if (sensor_interface_dev_spec[dev] == SENSOR_INTERFACE_SPEC_SPI)
+		reg_addr |= 0x80; // set read bit
+	int err = ssi_reg_read_byte_io(dev, reg_addr, &old_value, SSI_UNREPORTED);
+	if (err)
+		return ssi_report_error(dev, "reg_update", requested_reg, err);
+	new_value = (old_value & ~mask) | (value & mask);
+	if (new_value == old_value) {
+		return 0;
+	}
+	if (sensor_interface_dev_spec[dev] == SENSOR_INTERFACE_SPEC_SPI)
+		reg_addr &= 0x7f; // clear read bit
+	err = ssi_reg_write_byte_io(dev, reg_addr, new_value, SSI_UNREPORTED);
+	return ssi_report_error(dev, "reg_update", requested_reg, err);
+}
+
+int ssi_reg_read_interval(enum sensor_interface_dev dev, uint8_t start_addr, uint8_t *buf, uint32_t num_bytes, uint32_t interval)
+{
+	uint8_t requested_reg = start_addr;
+#if DEBUG || DEBUG_RATE
+	uint32_t start = k_cycle_get_32();
+#endif
+	#if CONFIG_SOC_NRF52832
+	uint32_t maxcnt = 255; // easyeda-maxcnt-bits = <8>
+	#elif CONFIG_SOC_NRF52810
+	uint32_t maxcnt = 1023; // easyeda-maxcnt-bits = <10>
+	#else
+	uint32_t maxcnt = 2048; // all other SOC have >11 bits
+	#endif
+	if (interval == 0 || interval > maxcnt)
+		return ssi_report_error(dev, "reg_read_interval", requested_reg, -EINVAL);
+
+	// TODO: better way to handle with spi?
+	// TODO: not working
+	if (sensor_interface_dev_spec[dev] == SENSOR_INTERFACE_SPEC_SPI)
+		start_addr |= 0x80; // set read bit
+	int err = ssi_write_unreported(dev, &start_addr, 1); // Start read buffer
+	if (err)
+		return ssi_report_error(dev, "reg_read_interval", requested_reg, err);
+	interval *= maxcnt / interval;
+	while (num_bytes > 0)
+	{
+#if DEBUG || DEBUG_RATE
+		LOG_DBG("ssi_reg_read_interval: num_bytes=%u", num_bytes);
+#endif
+		if (interval > num_bytes)
+			interval = num_bytes;
+		err = ssi_read_unreported(dev, buf, interval);
+		if (err)
+			return ssi_report_error(dev, "reg_read_interval", requested_reg, err);
+		buf += interval;
+		num_bytes -= interval;
+	}
+#if DEBUG || DEBUG_RATE
+	uint32_t end = k_cycle_get_32();
+	LOG_DBG("ssi_reg_read_interval: us=%u", k_cyc_to_us_near32(end - start));
+#endif
+	return err;
+}
+
+int ssi_burst_read_interval(enum sensor_interface_dev dev, uint8_t start_addr, uint8_t *buf, uint32_t num_bytes, uint32_t interval)
+{
+#if DEBUG || DEBUG_RATE
+	uint32_t start = k_cycle_get_32();
+#endif
+	int err = 0;
+#if CONFIG_SOC_NRF52832
+	uint32_t maxcnt = 255; // easyeda-maxcnt-bits = <8>
+#elif CONFIG_SOC_NRF52810
+	uint32_t maxcnt = 1023; // easyeda-maxcnt-bits = <10>, I2C timeout (>25ms) on higher interval
+#else
+	uint32_t maxcnt = sensor_interface_dev_spec[dev] == SENSOR_INTERFACE_SPEC_SPI ? 16383 : 1023; // all other SOC have >=14 bits, I2C timeout (>25ms) on higher interval
+#endif
+	if (interval == 0 || interval > maxcnt)
+		return ssi_report_error(dev, "burst_read_interval", start_addr, -EINVAL);
+	interval *= maxcnt / interval;
+	while (num_bytes > 0)
+	{
+#if DEBUG || DEBUG_RATE
+		LOG_DBG("ssi_burst_read_interval: num_bytes=%u", num_bytes);
+#endif
+		if (interval > num_bytes)
+			interval = num_bytes;
+		err = ssi_burst_read_io(dev, start_addr, buf, interval, SSI_UNREPORTED);
+		if (err)
+			return ssi_report_error(dev, "burst_read_interval", start_addr, err);
+		buf += interval;
+		num_bytes -= interval;
+	}
+#if DEBUG || DEBUG_RATE
+	uint32_t end = k_cycle_get_32();
+	LOG_DBG("ssi_burst_read_interval: us=%u", k_cyc_to_us_near32(end - start));
+#endif
+	return err;
+}

@@ -1,0 +1,401 @@
+/*
+	SlimeVR Code is placed under the MIT license
+	Copyright (c) 2025 SlimeVR Contributors
+
+	Permission is hereby granted, free of charge, to any person obtaining a copy
+	of this software and associated documentation files (the "Software"), to deal
+	in the Software without restriction, including without limitation the rights
+	to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+	copies of the Software, and to permit persons to whom the Software is
+	furnished to do so, subject to the following conditions:
+
+	The above copyright notice and this permission notice shall be included in
+	all copies or substantial portions of the Software.
+
+	THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+	IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+	FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+	AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+	LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+	OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+	THE SOFTWARE.
+*/
+#include "globals.h"
+#include "sensor/sensor.h"
+#include "system/system.h"
+#include "util.h"
+#include "connection/tracker_events.h"
+
+#include <math.h>
+#include <errno.h>
+#include <string.h>
+
+#include "sensor/magneto/magneto1_4.h"
+
+#include "bias_collect.h"
+#include "cal_imu.h"
+#include "cal_mag.h"
+#include "cal_sample.h"
+#include "calibration.h"
+#if CONFIG_SENSOR_USE_TCAL
+#include "tcal_mls_lut.h"
+#include "tcal_runtime.h"
+#endif
+
+LOG_MODULE_REGISTER(cal_imu, LOG_LEVEL_INF);
+
+static void imu_step(uint16_t operation_id, struct led_token feedback, uint8_t phase)
+{
+	cal_event_step(operation_id, phase, 0);
+	sensor_calibration_stage(feedback,
+		phase == CAL_PHASE_COLLECT ? LED_COLLECT_STILL : LED_PROCESSING);
+	if (operation_id) {
+		tracker_events_notify();
+	}
+}
+
+static void imu_failed(uint16_t operation_id, struct led_token feedback, uint8_t phase, uint8_t reason)
+{
+	cal_event_end(operation_id, CAL_OUTCOME_FAILED, phase, reason);
+	sensor_calibration_result(feedback, LED_FAILED);
+	if (operation_id) {
+		tracker_events_notify();
+	}
+}
+
+static void imu_cancelled(uint16_t operation_id, struct led_token feedback)
+{
+	cal_event_end(operation_id, CAL_OUTCOME_CANCELLED, CAL_PHASE_APPLY_PENDING, CAL_REASON_RESET);
+	sensor_calibration_result(feedback, LED_CANCELLED);
+	if (operation_id) {
+		tracker_events_notify();
+	}
+}
+
+
+void sensor_calibrate_imu(void)
+{
+	const uint16_t operation_id = sensor_calibration_current_operation();
+	const struct led_token feedback = sensor_calibration_current_feedback();
+	const uint32_t generation = sensor_calibration_current_generation();
+	int prior_error = 0;
+	float g_bias[3] = {0};
+	LOG_INF("Calibrating main gyroscope zero rate offset");
+	LOG_INF("Rest the device on a stable surface");
+
+	sensor_calibration_stage(feedback, LED_WAIT_STILL);
+	if (!wait_for_motion(false, 6)) // Wait for accelerometer to settle, timeout 3s
+	{
+		imu_failed(operation_id, feedback, CAL_PHASE_WAIT_STILL, CAL_REASON_MOTION);
+		return; // Timeout, calibration failed
+	}
+
+	sensor_calibration_stage(feedback, LED_COLLECT_STILL);
+	k_msleep(500); // Delay before beginning acquisition
+
+#if CONFIG_SENSOR_USE_TCAL
+	// Variables to store average temperature and temperature range from calibration
+	float avg_temp = NAN;
+	float temp_range = NAN;
+#endif
+
+	LOG_INF("Reading data");
+	imu_step(operation_id, feedback, CAL_PHASE_COLLECT);
+#if CONFIG_SENSOR_USE_TCAL
+	int err = sensor_offsetBias(g_bias, &avg_temp, &temp_range);
+#else
+	int err = sensor_offsetBias(g_bias, NULL, NULL);
+#endif
+	if (err) // This takes about 3s
+	{
+		if (err == -1) {
+			LOG_INF("Motion detected");
+		} else if (err == -2) {
+			LOG_WRN("Calibration sampling timed out");
+		} else if (err == -3) {
+			LOG_INF("Temperature instability detected");
+		} else if (err == BIAS_COLLECT_INSUFFICIENT_SAMPLES) {
+			LOG_WRN("Calibration sampling completed with insufficient samples");
+		} else {
+			LOG_WRN("Calibration failed: %d", err);
+		}
+		/* Do not run NAN-through-validate: CMSIS v_epsilon can treat NaN as
+		 * in-range and then apply cleared zero bias to NVS/fusion. */
+		LOG_INF("Previous calibration unchanged");
+		imu_failed(operation_id, feedback, CAL_PHASE_COLLECT,
+			   err == -1 ? CAL_REASON_MOTION : err == -2 ? CAL_REASON_SAMPLE_TIMEOUT :
+			   err == -3 ? CAL_REASON_TEMPERATURE :
+			   err == BIAS_COLLECT_INSUFFICIENT_SAMPLES ? CAL_REASON_INSUFFICIENT_SAMPLES :
+			   CAL_REASON_SENSOR_UNAVAILABLE);
+		return;
+	}
+	LOG_INF("Gyroscope bias: %.5f %.5f %.5f", (double)g_bias[0], (double)g_bias[1], (double)g_bias[2]);
+#if CONFIG_SENSOR_USE_TCAL
+	sys_warm_transaction_begin();
+	if (!sensor_calibration_generation_valid(generation)) {
+		sys_warm_transaction_end(false);
+		imu_cancelled(operation_id, feedback);
+		return;
+	}
+#endif
+	bool persist_gyro = true;
+#if CONFIG_SENSOR_USE_TCAL
+	persist_gyro = !sensor_tcal_get_auto_calibration() || isnan(avg_temp);
+#endif
+	if (feedback.session && sensor_calibration_generation_valid(generation)) {
+		sensor_calibration_result(feedback, LED_STAGE_ACK);
+	}
+	imu_step(operation_id, feedback, CAL_PHASE_APPLY_PENDING);
+	int commit_err = sensor_calibration_commit_bias(g_bias, persist_gyro, operation_id, feedback, prior_error,
+		generation);
+	if (commit_err) {
+#if CONFIG_SENSOR_USE_TCAL
+		sys_warm_transaction_end(false);
+#endif
+		LOG_WRN("Calibration candidate rejected: %d; previous calibration unchanged", commit_err);
+		if (commit_err == -ECANCELED) {
+			imu_cancelled(operation_id, feedback);
+		} else {
+			imu_failed(operation_id, feedback, CAL_PHASE_APPLY_PENDING, CAL_REASON_CANDIDATE_REJECTED);
+		}
+		return;
+	}
+
+#if CONFIG_SENSOR_USE_TCAL
+	if (sensor_tcal_get_auto_calibration() && !isnan(avg_temp)) {
+		// Auto temperature calibration enabled: save to tcal data points only, don't change gyro bias
+		int temp_err = sys_write(MAIN_GYRO_TEMP_ID, &retained->gyroTemp, &avg_temp, sizeof(avg_temp));
+		if (temp_err < 0) {
+			prior_error = temp_err;
+		}
+		LOG_INF("T-Cal auto-calibration enabled: saving to tcal data only, not updating gyro bias");
+
+		// Update temperature direction tracking for hysteresis-aware blending
+		if (!isnan(tcal_direction_ref_temp)) {
+			float delta = avg_temp - tcal_direction_ref_temp;
+			if (delta > 0.2f) {
+				tcal_current_direction = TCAL_DIR_RISING;
+			} else if (delta < -0.2f) {
+				tcal_current_direction = TCAL_DIR_FALLING;
+			}
+			// If delta is within ±0.2°C, keep previous direction (noise filter)
+		}
+		tcal_direction_ref_temp = avg_temp;
+
+		// Check if T-Cal coverage is good - if so, skip saving a redundant point
+		tcal_quality_t quality;
+		bool has_good_coverage = false;
+
+		if (sensor_tcal_assess_quality(avg_temp, &quality) && quality.temp_in_range) {
+			// Find closest point and check for upper/lower bounds
+			float closest_distance = INFINITY;
+			bool has_lower_bound = false; // Point below current temp
+			bool has_upper_bound = false; // Point above current temp
+			float sampling_interval = 1.0f / CONFIG_SENSOR_POLY_STEPS_PER_DEGREE;
+
+			for (int i = 0; i < TCAL_BUFFER_SIZE; i++) {
+				if (retained->tempCalPoints[i].temp != 0.0f) {
+					float point_temp = retained->tempCalPoints[i].temp;
+					float distance = fabsf(point_temp - avg_temp);
+
+					if (distance < closest_distance) {
+						closest_distance = distance;
+					}
+
+					// Check if this point is below or above current temp
+					if (point_temp < avg_temp) {
+						has_lower_bound = true;
+					} else if (point_temp > avg_temp) {
+						has_upper_bound = true;
+					}
+				}
+			}
+
+			// Coverage is good when the closest point is within the sampling interval.
+			if (closest_distance <= sampling_interval) {
+				// Very close to existing point - definitely good coverage
+				has_good_coverage = true;
+				LOG_INF(
+					"T-Cal: Excellent coverage at %.2fC (closest: %.2fC away, within sampling interval)",
+					(double)avg_temp,
+					(double)closest_distance
+				);
+			} else {
+				// Log why coverage is insufficient
+				if (!has_lower_bound || !has_upper_bound) {
+					LOG_INF(
+						"T-Cal: Coverage insufficient at %.2fC (missing %s bound, closest: %.2fC)",
+						(double)avg_temp,
+						!has_lower_bound ? "lower" : "upper",
+						(double)closest_distance
+					);
+				} else {
+					LOG_INF(
+						"T-Cal: Coverage insufficient at %.2fC (closest: %.2fC > threshold: %.2fC)",
+						(double)avg_temp,
+						(double)closest_distance,
+						(double)(sampling_interval * 1.0f)
+					);
+				}
+			}
+		}
+
+		if (has_good_coverage) {
+			LOG_INF("T-Cal: Coverage sufficient at %.2fC, skipping point save", (double)avg_temp);
+		}
+
+		if (!has_good_coverage) {
+			// Save as new calibration point
+			LOG_INF(
+				"T-Cal: Saving calibration point at average temp %.2fC (range: %.2fC)",
+				(double)avg_temp,
+				(double)temp_range
+			);
+			int idx = TEMP_TO_IDX(avg_temp);
+			if (idx >= 0 && idx < TCAL_BUFFER_SIZE) {
+				sensor_tcal_lock();
+
+				// Hysteresis-aware blending: prefer rising-phase data.
+				// Use tcal_current_direction directly — do not infer from temp comparison.
+				if (retained->tempCalPoints[idx].temp != 0.0f) {
+					float ema_alpha;
+					switch (tcal_current_direction) {
+					case TCAL_DIR_RISING:
+						ema_alpha = TCAL_HYSTERESIS_EMA_RISING;
+						break;
+					case TCAL_DIR_FALLING:
+						ema_alpha = TCAL_HYSTERESIS_EMA_FALLING;
+						break;
+					default:
+						ema_alpha = TCAL_HYSTERESIS_EMA_UNKNOWN;
+						break;
+					}
+					LOG_INF(
+						"T-Cal: Blending with existing point (dir: %s, alpha: %.2f)",
+						tcal_current_direction == TCAL_DIR_RISING    ? "rising"
+						: tcal_current_direction == TCAL_DIR_FALLING ? "falling"
+																	 : "unknown",
+						(double)ema_alpha
+					);
+					for (int axis = 0; axis < 3; axis++) {
+						g_bias[axis]
+							= ema_alpha * g_bias[axis] + (1.0f - ema_alpha) * retained->tempCalPoints[idx].bias[axis];
+					}
+					LOG_INF(
+						"T-Cal: Blended bias: %.5f %.5f %.5f",
+						(double)g_bias[0],
+						(double)g_bias[1],
+						(double)g_bias[2]
+					);
+				} else {
+					retained->tempCalState.count++; // New slot
+				}
+				retained->tempCalPoints[idx].temp = avg_temp;
+				memcpy(retained->tempCalPoints[idx].bias, g_bias, sizeof(g_bias));
+				retained->tempCalState.valid = false; // Invalidate old curve
+				sensor_tcal_refresh_model();
+				sensor_tcal_mark_measured_bias();
+				sensor_tcal_unlock();
+				/* User-initiated: warm-mark then flush so pin-reset keeps points. */
+				update_tcal_state();
+				int warm_err = sys_flush_warm();
+				if (warm_err < 0) {
+					prior_error = warm_err;
+				}
+
+			} else {
+				LOG_WRN(
+					"T-Cal: Temperature %.2fC is outside the configured calibration range. Point not saved.",
+					(double)avg_temp
+				);
+			}
+		}
+	}
+#endif
+
+#if CONFIG_SENSOR_USE_TCAL
+	sensor_calibration_record_storage_error(generation, prior_error);
+	sys_warm_transaction_end(false);
+#endif
+	LOG_INF("Calibration queued for next sensor frame");
+}
+
+#if CONFIG_SENSOR_USE_ACCEL_CALIBRATION
+// Minimum poses required to save a partial accelerometer calibration.
+#define CALIB_MIN_POSES_FOR_PARTIAL 6
+
+void sensor_calibrate_accel(void)
+{
+	const uint16_t operation_id = sensor_calibration_current_operation();
+	const struct led_token feedback = sensor_calibration_current_feedback();
+	const uint32_t generation = sensor_calibration_current_generation();
+	bool partial = false;
+	float a_inv[4][3];
+	int captured_count = 0;
+	LOG_INF("Calibrating main accelerometer (18 orientations)");
+	LOG_INF("Rest the device on a stable surface");
+
+	sensor_calibration_identity_accel(a_inv);
+	int err = sensor_calibration_collect_accel_poses(a_inv, &captured_count);
+	if (err) {
+		if (err == -3) {
+			// Timeout occurred - check if we have enough samples for partial calibration
+			LOG_WRN("Calibration timeout after %d poses (minimum: %d)", captured_count, CALIB_MIN_POSES_FOR_PARTIAL);
+			if (captured_count >= CALIB_MIN_POSES_FOR_PARTIAL) {
+				// We have enough samples, try to calculate calibration from partial data
+				LOG_INF("Attempting partial calibration with %d poses...", captured_count);
+				imu_step(operation_id, feedback, CAL_PHASE_FIT);
+				wait_for_threads();
+				err = magneto_current_calibration(a_inv, mag_cal_workspace.ata, norm_sum, sample_count);
+				magneto_reset();
+				partial = !err;
+			} else {
+				// Not enough samples - discard and restore previous calibration
+				LOG_ERR("Insufficient poses for calibration, discarding data");
+				magneto_reset();
+				imu_failed(operation_id, feedback, CAL_PHASE_WAIT_POSE, CAL_REASON_INSUFFICIENT_SAMPLES);
+				return; // Existing calibration is preserved in accBAinv
+			}
+		} else {
+			magneto_reset();
+			if (err == -1) {
+				LOG_INF("Motion detected");
+			}
+		}
+	}
+	if (err) {
+		LOG_WRN("Accelerometer calibration failed: %d; previous calibration unchanged", err);
+		imu_failed(operation_id, feedback, CAL_PHASE_FIT, CAL_REASON_FIT_ERROR);
+		return;
+	}
+
+	if (!err) {
+		LOG_INF("Accelerometer matrix:");
+		for (int i = 0; i < 3; i++) {
+			LOG_INF(
+				"%.5f %.5f %.5f %.5f",
+				(double)a_inv[0][i],
+				(double)a_inv[1][i],
+				(double)a_inv[2][i],
+				(double)a_inv[3][i]
+			);
+		}
+	}
+	if (partial) {
+		cal_event_set_completion_reason(operation_id, CAL_REASON_PARTIAL);
+	}
+	imu_step(operation_id, feedback, CAL_PHASE_APPLY_PENDING);
+	int commit_err = sensor_calibration_commit_accel(a_inv, operation_id, feedback, partial, generation);
+	if (commit_err) {
+		LOG_WRN("Accelerometer calibration candidate rejected: %d; previous calibration unchanged", commit_err);
+		if (commit_err == -ECANCELED) {
+			imu_cancelled(operation_id, feedback);
+		} else {
+			imu_failed(operation_id, feedback, CAL_PHASE_APPLY_PENDING, CAL_REASON_CANDIDATE_REJECTED);
+		}
+		return;
+	}
+	LOG_INF("Accelerometer calibration queued for next sensor frame");
+
+}
+#endif

@@ -1,0 +1,4 @@
+identifier: promicro_uf2/nrf52840/dtqsys
+name: DTQSYS ProMicro nRF52840 ICM45686 QMC6309
+vendor: nordic
+soc: nrf52840

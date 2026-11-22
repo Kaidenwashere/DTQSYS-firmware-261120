@@ -1,0 +1,410 @@
+#include <math.h>
+#include <string.h>
+
+#include <zephyr/logging/log.h>
+#include <hal/nrf_gpio.h>
+
+#include "LSM6DSM.h"
+#include "LSM6DSV.h" // Common functions
+#include "lsm6dsx_select.h"
+#include "sensor/sensor_none.h"
+
+#define PACKET_SIZE 7              // first byte is pattern, only 6 actual sample bytes
+#define FIFO_SANITY_MAX_SAMPLES 32 // guard against corrupted DIFF_FIFO reads
+
+static uint8_t accel_fs = DSM_FS_XL_16G;
+static uint8_t gyro_fs = DSM_FS_G_2000DPS;
+
+enum dsm_fifo_kind { DSM_FIFO_NONE, DSM_FIFO_ACCEL, DSM_FIFO_GYRO, DSM_FIFO_MIXED };
+enum dsm_sample_kind { DSM_SAMPLE_GYRO = 1, DSM_SAMPLE_ACCEL = 2 };
+static struct {
+	enum dsm_fifo_kind kind;
+	uint8_t ratio;
+	bool gyro_dominant;
+} fifo_shape;
+
+LOG_MODULE_REGISTER(LSM6DSM, LOG_LEVEL_DBG);
+
+int lsm6dsm_init(
+	float clock_rate,
+	float accel_period_s,
+	float gyro_period_s,
+	float *accel_actual_period_s,
+	float *gyro_actual_period_s
+)
+{
+	ARG_UNUSED(clock_rate);
+	// setup interface for SPI
+	sensor_interface_spi_configure(SENSOR_INTERFACE_DEV_IMU, MHZ(10), 0);
+	int err = ssi_reg_write_byte(
+		SENSOR_INTERFACE_DEV_IMU,
+		LSM6DSM_CTRL3,
+		0x74
+	); // freeze register until done reading, increment register address during multi-byte access (BDU, IF_INC), INT
+	   // H_LACTIVE active low, PP_OD open-drain
+	last_accel_odr = 0xff; // reset last odr
+	last_gyro_odr = 0xff;  // reset last odr
+	err |= lsm6dsm_update_odr(accel_period_s, gyro_period_s, accel_actual_period_s, gyro_actual_period_s);
+	return (err < 0 ? err : 0);
+}
+
+void lsm6dsm_update_fs(float accel_range, float gyro_range, float *accel_actual_range, float *gyro_actual_range)
+{
+	accel_fs = lsm6dsx_accel_range(&accel_range);
+	gyro_fs = lsm6dsx_gyro_range(&gyro_range);
+
+	accel_sensitivity = accel_range / 32768.0f;
+	gyro_sensitivity = 35.0f * gyro_range / 1000000.0f;
+
+	*accel_actual_range = accel_range;
+	*gyro_actual_range = gyro_range;
+}
+
+int lsm6dsm_update_odr(
+	float accel_period_s,
+	float gyro_period_s,
+	float *accel_actual_period_s,
+	float *gyro_actual_period_s
+)
+{
+	int requested_odr_hz;
+	uint8_t accel_mode;
+	uint8_t gyro_mode;
+	uint8_t accel_odr_bits;
+	uint8_t gyro_odr_bits;
+	uint8_t gyro_sleep_bits = DSM_OP_MODE_G_AWAKE;
+
+	// Calculate accel
+	if (accel_period_s <= 0 || accel_period_s == INFINITY) // off, standby interpreted as off
+	{
+		// set High perf mode and off odr on XL
+		accel_mode = DSM_OP_MODE_XL_HP;
+		accel_odr_bits = DSM_ODR_OFF;
+		requested_odr_hz = 0;
+	} else {
+		// set High perf mode and select odr on XL
+		accel_mode = DSM_OP_MODE_XL_HP;
+		requested_odr_hz = 1 / accel_period_s;
+	}
+
+	if (requested_odr_hz == 0) {
+		accel_period_s = 0; // off
+		accel_odr_bits = DSM_ODR_OFF;
+	} else {
+		accel_odr_bits = lsm6dsx_select_odr(&accel_period_s, requested_odr_hz);
+	}
+
+	// Calculate gyro
+	if (gyro_period_s <= 0) // off
+	{
+		gyro_mode = DSM_OP_MODE_G_HP;
+		gyro_odr_bits = DSM_ODR_OFF;
+		requested_odr_hz = 0;
+	} else if (gyro_period_s == INFINITY) // sleep
+	{
+		gyro_mode = DSM_OP_MODE_G_NP;
+		gyro_sleep_bits = DSM_OP_MODE_G_SLEEP;
+		gyro_odr_bits = last_gyro_odr; // using last ODR
+		requested_odr_hz = -1;         /* not off: skip ODR_OFF overwrite below */
+	} else {
+		gyro_mode = DSM_OP_MODE_G_HP;
+		gyro_odr_bits = 0; // Initialized before the rate-selection branches below.
+		requested_odr_hz = 1 / gyro_period_s;
+	}
+
+	if (requested_odr_hz == 0) {
+		gyro_period_s = 0; // off
+		gyro_odr_bits = DSM_ODR_OFF;
+	} else if (requested_odr_hz < 0) {
+		/* Sleep retains the previously selected gyro ODR. */
+		gyro_period_s = INFINITY;
+	} else {
+		gyro_odr_bits = lsm6dsx_select_odr(&gyro_period_s, requested_odr_hz);
+		if (gyro_odr_bits == DSM_ODR_6_66kHz) {
+			gyro_period_s = 1.0 / 6660;
+		}
+	}
+
+	if (last_accel_mode == accel_mode && last_gyro_mode == gyro_mode && last_accel_odr == accel_odr_bits
+		&& last_gyro_odr == gyro_odr_bits) {
+		*accel_actual_period_s = accel_period_s;
+		*gyro_actual_period_s = gyro_period_s;
+		return 0; /* already configured — success for err|= callers */
+	}
+
+	const bool accel_active = accel_odr_bits != DSM_ODR_OFF;
+	const bool gyro_active = gyro_odr_bits != DSM_ODR_OFF && gyro_sleep_bits == DSM_OP_MODE_G_AWAKE;
+	uint8_t fifo_odr_bits = MAX(accel_active ? accel_odr_bits : 0, gyro_active ? gyro_odr_bits : 0);
+	uint8_t gyro_distance = (fifo_odr_bits - (gyro_active ? gyro_odr_bits : 0)) >> 4;
+	uint8_t accel_distance = (fifo_odr_bits - (accel_active ? accel_odr_bits : 0)) >> 4;
+	uint8_t gyro_decimation_bits = !gyro_active || gyro_distance >= 6
+		? 0 : (gyro_distance >= 2 ? gyro_distance + 2 : gyro_distance + 1);
+	uint8_t accel_decimation_bits = !accel_active || accel_distance >= 6
+		? 0 : (accel_distance >= 2 ? accel_distance + 2 : accel_distance + 1);
+	enum dsm_fifo_kind kind = gyro_decimation_bits
+		? (accel_decimation_bits ? DSM_FIFO_MIXED : DSM_FIFO_GYRO)
+		: (accel_decimation_bits ? DSM_FIFO_ACCEL : DSM_FIFO_NONE);
+	bool gyro_dominant = gyro_odr_bits >= accel_odr_bits;
+	uint8_t ratio = kind == DSM_FIFO_MIXED
+		? (uint8_t)(1u << (gyro_dominant ? accel_distance : gyro_distance)) : 1;
+
+	int err = ssi_reg_write_byte(
+		SENSOR_INTERFACE_DEV_IMU,
+		LSM6DSM_CTRL1,
+		accel_odr_bits | accel_fs
+	);                                                                              // set accel ODR and FS
+	err |= ssi_reg_write_byte(SENSOR_INTERFACE_DEV_IMU, LSM6DSM_CTRL6, accel_mode); // set accelerator perf mode
+
+	err |= ssi_reg_write_byte(
+		SENSOR_INTERFACE_DEV_IMU,
+		LSM6DSM_CTRL2,
+		gyro_odr_bits | gyro_fs
+	);                                                                             // set gyro ODR and mode
+	err |= ssi_reg_write_byte(SENSOR_INTERFACE_DEV_IMU, LSM6DSM_CTRL7, gyro_mode); // set gyroscope perf mode
+	err |= ssi_reg_write_byte(
+		SENSOR_INTERFACE_DEV_IMU,
+		LSM6DSM_CTRL4,
+		gyro_sleep_bits
+	); // set gyroscope awake/sleep mode
+
+	err |= ssi_reg_write_byte(
+		SENSOR_INTERFACE_DEV_IMU,
+		LSM6DSM_FIFO_CTRL3,
+		(gyro_decimation_bits << 3) | accel_decimation_bits
+	); // set decimation
+	err |= ssi_reg_write_byte(
+		SENSOR_INTERFACE_DEV_IMU,
+		LSM6DSM_FIFO_CTRL5,
+		(fifo_odr_bits >> 1) | 0x06
+	); // set FIFO ODR, FIFO Continuous mode
+	if (err) {
+		return err;
+	}
+
+	last_accel_mode = accel_mode;
+	last_gyro_mode = gyro_mode;
+	last_accel_odr = accel_odr_bits;
+	last_gyro_odr = gyro_odr_bits;
+	fifo_shape.kind = kind;
+	fifo_shape.ratio = ratio;
+	fifo_shape.gyro_dominant = gyro_dominant;
+	*accel_actual_period_s = accel_period_s;
+	*gyro_actual_period_s = gyro_period_s;
+
+	return 0;
+}
+
+uint16_t lsm6dsm_fifo_read(uint8_t *data, uint16_t capacity_bytes)
+{
+	int err = 0;
+	uint16_t total_packets = 0;
+	if (fifo_shape.kind == DSM_FIFO_NONE) {
+		return 0;
+	}
+	const uint8_t cycle_samples = fifo_shape.kind == DSM_FIFO_MIXED ? fifo_shape.ratio + 1 : 1;
+
+	while (capacity_bytes >= PACKET_SIZE) {
+		uint8_t status[4];
+		int64_t st0 = k_uptime_ticks();
+		err |= ssi_burst_read(SENSOR_INTERFACE_DEV_IMU, LSM6DSM_FIFO_STATUS1, status, 4);
+		{
+			uint64_t st_us = k_ticks_to_us_near64(k_uptime_ticks() - st0);
+			if (st_us > 2000) {
+				LOG_DBG("Slow I2C read: %llu us (status, 4 B)", (unsigned long long)st_us);
+			}
+		}
+		if (err) {
+			break;
+		}
+		if (status[1] & BIT(6)) {
+			sensor_gyro_report_discontinuity();
+		}
+
+		uint16_t words = (uint16_t)((status[1] & 7) << 8 | status[0]); // DIFF_FIFO[10:0]
+		if (!words) {                                                  // nothing to do
+			break;
+		}
+
+		uint16_t pattern = (uint16_t)((status[3] & 3) << 8 | status[2]); // FIFO_PATTERN[9:0]
+
+		/* pattern % 3 is the word offset in a sample; skip a partial
+		 * sample so the read starts on a sample boundary. */
+		uint16_t tag = pattern / 3;
+		if (pattern % 3 != 0) // misaligned!
+		{
+			LOG_WRN("FIFO not aligned");
+			uint16_t skip_words = (uint16_t)(3 - (pattern % 3));
+			uint8_t discard[8];
+			err |= ssi_burst_read(SENSOR_INTERFACE_DEV_IMU, LSM6DSM_FIFO_DATA_OUT_L, discard, skip_words * 2);
+			words = (words > skip_words) ? (uint16_t)(words - skip_words) : 0;
+			tag = (uint16_t)((tag + 1) % cycle_samples);
+		}
+
+		uint16_t samples = words / 3;
+		uint16_t packet_capacity = capacity_bytes / PACKET_SIZE;
+		if (samples > packet_capacity) {
+			LOG_WRN("FIFO read buffer limit reached, %d packets retained in FIFO", samples - packet_capacity);
+			samples = packet_capacity;
+		}
+		/* Bound each batch when a status read reports an implausibly large word count. */
+		if (samples > FIFO_SANITY_MAX_SAMPLES) {
+			LOG_DBG("FIFO status spike: %u words -> clamped to %u samples", words, FIFO_SANITY_MAX_SAMPLES);
+			samples = FIFO_SANITY_MAX_SAMPLES;
+		}
+		if (samples == 0) {
+			break;
+		}
+
+		/* Hardware supplies untagged 16-bit words; prepend a software
+		 * pattern index to each six-byte sample for fifo_process. */
+		uint8_t raw[24 * 6];
+		while (samples > 0) {
+			uint16_t n = samples;
+			if (n > (uint16_t)(sizeof(raw) / 6)) {
+				n = (uint16_t)(sizeof(raw) / 6);
+			}
+			int64_t d0 = k_uptime_ticks();
+			err |= ssi_burst_read(SENSOR_INTERFACE_DEV_IMU, LSM6DSM_FIFO_DATA_OUT_L, raw, n * 6);
+			if (err) {
+				return total_packets;
+			}
+			{
+				uint64_t d_us = k_ticks_to_us_near64(k_uptime_ticks() - d0);
+				if (d_us > 2000) {
+					LOG_DBG("Slow I2C read: %llu us (data, %u B)", (unsigned long long)d_us, n * 6);
+				}
+			}
+			for (uint16_t i = 0; i < n; i++) {
+				uint8_t position = (uint8_t)((tag + i) % cycle_samples);
+				bool gyro = fifo_shape.kind == DSM_FIFO_GYRO
+					|| (fifo_shape.kind == DSM_FIFO_MIXED
+						&& (position == 0 || (position > 1 && fifo_shape.gyro_dominant)));
+				data[i * PACKET_SIZE] = gyro ? DSM_SAMPLE_GYRO : DSM_SAMPLE_ACCEL;
+				memcpy(&data[i * PACKET_SIZE + 1], &raw[i * 6], PACKET_SIZE - 1);
+			}
+			samples -= n;
+			tag = (uint16_t)((tag + n) % cycle_samples);
+			data += n * PACKET_SIZE;
+			capacity_bytes -= n * PACKET_SIZE;
+			total_packets += n;
+		}
+	}
+	return total_packets;
+}
+
+static int lsm6dsm_fifo_process(uint16_t index, uint8_t *data, float a[3], float g[3])
+{
+	const uint16_t packet_offset = index * PACKET_SIZE;
+	const uint8_t *packet = &data[packet_offset];
+	uint8_t kind = packet[0];
+	if (kind != DSM_SAMPLE_GYRO && kind != DSM_SAMPLE_ACCEL) {
+		return 1;
+	}
+	if (kind == DSM_SAMPLE_GYRO) {
+		for (int i = 0; i < 3; i++) // x, y, z
+		{
+			g[i] = (int16_t)((((uint16_t)packet[2 + (i * 2)]) << 8) | packet[1 + (i * 2)]);
+			g[i] *= gyro_sensitivity;
+		}
+		return 0;
+	}
+	for (int i = 0; i < 3; i++) // x, y, z
+	{
+		a[i] = (int16_t)((((uint16_t)packet[2 + (i * 2)]) << 8) | packet[1 + (i * 2)]);
+		a[i] *= accel_sensitivity;
+	}
+	return 0;
+}
+
+/* Threshold is in fastest-stream samples. Mixed batches also include the slower stream. */
+uint8_t lsm6dsm_setup_DRDY(uint16_t threshold)
+{
+	uint32_t words = fifo_shape.kind == DSM_FIFO_NONE ? 0
+		: (fifo_shape.kind == DSM_FIFO_MIXED
+			? ((uint32_t)threshold + fifo_shape.ratio - 1) / fifo_shape.ratio + threshold : threshold) * 3u;
+	words = MIN(words, 0x7ffu);
+	uint8_t buf[2];
+	buf[0] = words & 0xFF;
+	buf[1] = (words >> 8) & 0x07;
+	ssi_burst_write(SENSOR_INTERFACE_DEV_IMU, LSM6DSM_FIFO_CTRL1, buf, 2);
+	/* LSM6DSM has no COUNTER_BDR (unlike LSM6DSV); use pulsed INT1_DRDY_G for
+	 * per-sample wakeup, with INT1_FTH as the burst/catch-up backup. */
+	ssi_reg_write_byte(SENSOR_INTERFACE_DEV_IMU, LSM6DSM_INT1_CTRL, 0x0A);      // INT1_FTH | INT1_DRDY_G
+	ssi_reg_write_byte(SENSOR_INTERFACE_DEV_IMU, LSM6DSM_DRDY_PULSE_CFG, 0x80); // pulsed DRDY (75 us)
+	return NRF_GPIO_PIN_PULLUP << 4 | NRF_GPIO_PIN_SENSE_LOW; // active low
+}
+
+uint8_t lsm6dsm_setup_WOM(void)
+{
+
+	int err = ssi_reg_write_byte(
+		SENSOR_INTERFACE_DEV_IMU,
+		LSM6DSM_CTRL1,
+		DSM_ODR_208Hz | DSM_FS_XL_2G
+	);                                                                                     // set accel ODR and FS
+	err |= ssi_reg_write_byte(SENSOR_INTERFACE_DEV_IMU, LSM6DSM_CTRL6, DSM_OP_MODE_XL_NP); // set accel perf mode
+	err |= ssi_reg_write_byte(
+		SENSOR_INTERFACE_DEV_IMU,
+		LSM6DSM_CTRL8,
+		0x74
+	); // set HPCF_XL to the lowest bandwidth, enable HP_REF_MODE (set HP_REF_MODE, HP_SLOPE_XL_EN, HPCF_XL nonzero)
+	err |= ssi_reg_write_byte(SENSOR_INTERFACE_DEV_IMU, LSM6DSM_TAP_CFG, 0x10); // set SLOPE_FDS
+	err |= ssi_reg_write_byte(
+		SENSOR_INTERFACE_DEV_IMU,
+		LSM6DSM_WAKE_UP_THS,
+		0x01
+	);            // FS/64 per LSB: 1 * (2000 mg / 64) = 31.25 mg
+	k_msleep(12); // need to wait for accel to settle
+
+	err |= ssi_reg_write_byte(SENSOR_INTERFACE_DEV_IMU, LSM6DSM_TAP_CFG, 0x90); // enable interrupts (keep SLOPE_FDS)
+	err |= ssi_reg_write_byte(SENSOR_INTERFACE_DEV_IMU, LSM6DSM_MD1_CFG, 0x20); // route wake-up to INT1
+	err |= ssi_reg_write_byte(
+		SENSOR_INTERFACE_DEV_IMU,
+		LSM6DSM_CTRL3,
+		0x30
+	); // INT H_LACTIVE active low, PP_OD open-drain
+	if (err) {
+		return 0xFF;
+	}
+	return NRF_GPIO_PIN_PULLUP << 4 | NRF_GPIO_PIN_SENSE_LOW; // active low
+}
+
+#if CONFIG_SENSOR_USE_MAGNETOMETER
+static int lsm6dsm_ext_setup(enum sensor_ext_mode mode)
+{
+	if (mode != SENSOR_EXT_MODE_OFF && mode != SENSOR_EXT_MODE_I2C_PASSTHROUGH) {
+		return -1;
+	}
+
+	/* MASTER_CONFIG passthrough is effective only while CTRL10_C.FUNC_EN is set. */
+	int err = ssi_reg_update_byte(SENSOR_INTERFACE_DEV_IMU, 0x19, 0x04, 0x04);
+	err |= ssi_reg_update_byte(
+		SENSOR_INTERFACE_DEV_IMU,
+		0x1A,
+		0x05,
+		mode == SENSOR_EXT_MODE_I2C_PASSTHROUGH ? 0x04 : 0x00
+	);
+	return err;
+}
+#endif
+
+const sensor_imu_t sensor_imu_lsm6dsm
+	= {*lsm6dsm_init,
+	   *lsm_shutdown,
+
+	   *lsm6dsm_update_fs,
+	   *lsm6dsm_update_odr,
+
+	   *lsm6dsm_fifo_read,
+	   *lsm6dsm_fifo_process,
+	   *lsm_accel_read,
+	   *lsm_gyro_read,
+	   *lsm_temp_read,
+
+	   *lsm6dsm_setup_DRDY,
+	   *lsm6dsm_setup_WOM,
+
+#if CONFIG_SENSOR_USE_MAGNETOMETER
+	   .ext_setup = lsm6dsm_ext_setup,
+#endif
+	};

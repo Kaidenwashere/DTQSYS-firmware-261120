@@ -1,0 +1,304 @@
+/*
+	SlimeVR Code is placed under the MIT license
+	Copyright (c) 2025 SlimeVR Contributors
+
+	Permission is hereby granted, free of charge, to any person obtaining a copy
+	of this software and associated documentation files (the "Software"), to deal
+	in the Software without restriction, including without limitation the rights
+	to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+	copies of the Software, and to permit persons to whom the Software is
+	furnished to do so, subject to the following conditions:
+
+	The above copyright notice and this permission notice shall be included in
+	all copies or substantial portions of the Software.
+
+	THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+	IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+	FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+	AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+	LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+	OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+	THE SOFTWARE.
+*/
+#include "globals.h"
+#include "system/watchdog.h"
+#include "util.h"
+
+#include <errno.h>
+#include <string.h>
+#include <zephyr/sys/atomic.h>
+
+#include "cal_sample.h"
+
+LOG_MODULE_REGISTER(cal_sample, LOG_LEVEL_INF);
+
+/* A FIFO batch can contain more samples than a calibration consumer can use
+ * immediately. Keep a bounded queue of actual vectors so a publish cannot
+ * claim a sample that has already been overwritten by the next publish. When
+ * full, discard the oldest vector and retain the newest sample. */
+#define CAL_SAMPLE_QUEUE_CAPACITY 64
+
+struct cal_sample_vector {
+	float v[3];
+};
+
+static char __noinit __aligned(4) _k_fifo_buf_accel_sample_queue[
+	CAL_SAMPLE_QUEUE_CAPACITY * sizeof(struct cal_sample_vector)];
+static STRUCT_SECTION_ITERABLE(k_msgq, accel_sample_queue) =
+	Z_MSGQ_INITIALIZER(accel_sample_queue, _k_fifo_buf_accel_sample_queue,
+		sizeof(struct cal_sample_vector), CAL_SAMPLE_QUEUE_CAPACITY);
+static char __noinit __aligned(4) _k_fifo_buf_gyro_sample_queue[
+	CAL_SAMPLE_QUEUE_CAPACITY * sizeof(struct sensor_gyro_sample)];
+static STRUCT_SECTION_ITERABLE(k_msgq, gyro_sample_queue) =
+	Z_MSGQ_INITIALIZER(gyro_sample_queue, _k_fifo_buf_gyro_sample_queue,
+		sizeof(struct sensor_gyro_sample), CAL_SAMPLE_QUEUE_CAPACITY);
+#if CONFIG_SENSOR_USE_MAGNETOMETER
+static char __noinit __aligned(4) _k_fifo_buf_mag_sample_queue[
+	CAL_SAMPLE_QUEUE_CAPACITY * sizeof(struct cal_sample_vector)];
+static STRUCT_SECTION_ITERABLE(k_msgq, mag_sample_queue) =
+	Z_MSGQ_INITIALIZER(mag_sample_queue, _k_fifo_buf_mag_sample_queue,
+		sizeof(struct cal_sample_vector), CAL_SAMPLE_QUEUE_CAPACITY);
+#endif
+
+static float latest_accel[3] = {0};
+/* Serialize admission, nonblocking queue publication and session purge. The
+ * atomic state gives idle gyro/mag a lock-free exit and identifies publishers
+ * preempted before the lock across an end/begin boundary. */
+static struct k_spinlock sample_lock;
+static atomic_t sample_session;
+static uint32_t gyro_sample_sequence;
+#define CAL_SAMPLE_CHANNEL_MASK (CAL_SAMPLE_ACCEL | CAL_SAMPLE_GYRO | CAL_SAMPLE_MAG)
+static bool accel_snapshot_valid;
+#if CONFIG_SENSOR_USE_ACCEL_CALIBRATION
+static uint32_t accel_observation_sequence;
+static uint32_t accel_observation_time;
+#endif
+#if CONFIG_SENSOR_TCAL_HEATED
+static int64_t accel_snapshot_time;
+#endif
+
+static void publish_sample_locked(struct k_msgq *queue, const void *sample)
+{
+	struct sensor_gyro_sample discarded;
+
+	if (k_msgq_put(queue, sample, K_NO_WAIT) == -ENOMSG) {
+		/* Explicit overflow policy: discard the oldest queued vector and keep
+		 * the newest one. This is loss, never a duplicate or fabricated sample. */
+		(void)k_msgq_get(queue, &discarded, K_NO_WAIT);
+		(void)k_msgq_put(queue, sample, K_NO_WAIT);
+	}
+}
+
+#if CONFIG_SENSOR_USE_MAGNETOMETER
+static void publish_sample(struct k_msgq *queue, const float v[3], uint8_t channel)
+{
+	atomic_val_t session = atomic_get(&sample_session);
+	if (!(session & channel)) {
+		return;
+	}
+	k_spinlock_key_t key = k_spin_lock(&sample_lock);
+	if (session == atomic_get(&sample_session)) {
+		publish_sample_locked(queue, v);
+	}
+	k_spin_unlock(&sample_lock, key);
+}
+#endif
+
+static int wait_sample(struct k_msgq *queue, void *v, k_timeout_t timeout, const char *name)
+{
+	if (k_msgq_get(queue, v, timeout) != 0) {
+		LOG_ERR("%s wait timed out", name);
+		return -1;
+	}
+	return 0;
+}
+
+static void samples_set_channels(uint8_t channels)
+{
+	k_spinlock_key_t key = k_spin_lock(&sample_lock);
+	/* Advance the generation even when restarting the same channels. Unsigned
+	 * arithmetic also makes generation wrap defined. No producer can enqueue
+	 * between the purge and publication of the new admission state. */
+	atomic_val_t next = (atomic_val_t)(
+		((unsigned long)atomic_get(&sample_session) + CAL_SAMPLE_CHANNEL_MASK + 1)
+		& ~(unsigned long)CAL_SAMPLE_CHANNEL_MASK
+	);
+	k_msgq_purge(&accel_sample_queue);
+	k_msgq_purge(&gyro_sample_queue);
+#if CONFIG_SENSOR_USE_MAGNETOMETER
+	k_msgq_purge(&mag_sample_queue);
+#else
+	channels &= (uint8_t)~CAL_SAMPLE_MAG;
+#endif
+	gyro_sample_sequence = 0;
+	atomic_set(&sample_session, next | (channels & CAL_SAMPLE_CHANNEL_MASK));
+	k_spin_unlock(&sample_lock, key);
+}
+
+void sensor_calibration_samples_begin(uint8_t channels)
+{
+	samples_set_channels(channels);
+}
+
+void sensor_calibration_samples_end(void)
+{
+	samples_set_channels(0);
+}
+
+void sensor_sample_accel(const float a[3])
+{
+	atomic_val_t session = atomic_get(&sample_session);
+	k_spinlock_key_t key = k_spin_lock(&sample_lock);
+	memcpy(latest_accel, a, sizeof(latest_accel));
+	accel_snapshot_valid = true;
+#if CONFIG_SENSOR_USE_ACCEL_CALIBRATION
+	accel_observation_sequence++;
+	accel_observation_time = k_uptime_get_32();
+#endif
+	#if CONFIG_SENSOR_TCAL_HEATED
+	accel_snapshot_time = k_uptime_get();
+	#endif
+	if ((session & CAL_SAMPLE_ACCEL) && session == atomic_get(&sample_session)) {
+		publish_sample_locked(&accel_sample_queue, a);
+	}
+	k_spin_unlock(&sample_lock, key);
+}
+
+int sensor_wait_accel(float a[3], k_timeout_t timeout)
+{
+	return wait_sample(&accel_sample_queue, a, timeout, "Accelerometer");
+}
+
+bool sensor_peek_accel(float a[3])
+{
+	if (a == NULL) {
+		return false;
+	}
+	k_spinlock_key_t key = k_spin_lock(&sample_lock);
+	bool valid = accel_snapshot_valid;
+	if (valid) {
+		memcpy(a, latest_accel, sizeof(latest_accel));
+	}
+	k_spin_unlock(&sample_lock, key);
+	return valid;
+}
+
+#if CONFIG_SENSOR_TCAL_HEATED
+bool sensor_peek_accel_fresh(float a[3], int64_t max_age_ms)
+{
+	if (a == NULL || max_age_ms < 0) {
+		return false;
+	}
+	k_spinlock_key_t key = k_spin_lock(&sample_lock);
+	int64_t age = k_uptime_get() - accel_snapshot_time;
+	bool valid = accel_snapshot_valid && age >= 0 && age <= max_age_ms &&
+	             v_finite(latest_accel, 3);
+	if (valid) {
+		memcpy(a, latest_accel, sizeof(latest_accel));
+	}
+	k_spin_unlock(&sample_lock, key);
+	return valid;
+}
+#endif
+
+void sensor_sample_gyro(const float g[3], float dt)
+{
+	atomic_val_t session = atomic_get(&sample_session);
+	if (!(session & CAL_SAMPLE_GYRO)) {
+		return;
+	}
+	k_spinlock_key_t key = k_spin_lock(&sample_lock);
+	if (session == atomic_get(&sample_session)) {
+		struct sensor_gyro_sample sample = {
+			.v = {g[0], g[1], g[2]},
+			.dt = dt,
+			.sequence = ++gyro_sample_sequence,
+		};
+		publish_sample_locked(&gyro_sample_queue, &sample);
+	}
+	k_spin_unlock(&sample_lock, key);
+}
+
+int sensor_wait_gyro(struct sensor_gyro_sample *sample, k_timeout_t timeout)
+{
+	return wait_sample(&gyro_sample_queue, sample, timeout, "Gyroscope");
+}
+
+#if CONFIG_SENSOR_USE_MAGNETOMETER
+void sensor_sample_mag(const float m[3])
+{
+	publish_sample(&mag_sample_queue, m, CAL_SAMPLE_MAG);
+}
+
+int sensor_wait_mag(float m[3], k_timeout_t timeout)
+{
+	return wait_sample(&mag_sample_queue, m, timeout, "Magnetometer");
+}
+#endif
+
+static int wait_latest_accel(float a[3], k_timeout_t timeout)
+{
+	if (wait_sample(&accel_sample_queue, a, timeout, "Accelerometer") != 0) {
+		return -1;
+	}
+	/* Motion detection samples at its own 500 ms cadence. Discard the
+	 * intermediate backlog so it never classifies half-second-old motion. */
+	float newer[3];
+	while (k_msgq_get(&accel_sample_queue, newer, K_NO_WAIT) == 0) {
+		memcpy(a, newer, sizeof(newer));
+	}
+	return 0;
+}
+
+#if CONFIG_SENSOR_USE_ACCEL_CALIBRATION
+int sensor_wait_accel_observation(struct sensor_accel_observation *observation, k_timeout_t timeout)
+{
+	if (wait_latest_accel(observation->v, timeout) != 0) {
+		return -1;
+	}
+	k_spinlock_key_t key = k_spin_lock(&sample_lock);
+	memcpy(observation->v, latest_accel, sizeof(observation->v));
+	observation->sequence = accel_observation_sequence;
+	observation->observed_ms = accel_observation_time;
+	k_spin_unlock(&sample_lock, key);
+	return 0;
+}
+
+void sensor_discard_pending_accel(void)
+{
+	k_spinlock_key_t key = k_spin_lock(&sample_lock);
+	k_msgq_purge(&accel_sample_queue);
+	k_spin_unlock(&sample_lock, key);
+}
+#endif
+
+bool wait_for_motion(bool motion, int samples)
+{
+	uint8_t counts = 0;
+	float a[3], last_a[3];
+	if (wait_latest_accel(last_a, K_MSEC(1000))) {
+		return false;
+	}
+	LOG_INF("Accelerometer: %.5f %.5f %.5f", (double)last_a[0], (double)last_a[1], (double)last_a[2]);
+	for (int i = 0; i < samples + counts; i++) {
+		k_msleep(500);
+		/* Feed watchdog during long wait periods */
+		watchdog_feed(WDT_CHANNEL_CALIBRATION);
+		if (wait_latest_accel(a, K_MSEC(1000))) {
+			return false;
+		}
+		LOG_INF("Accelerometer: %.5f %.5f %.5f", (double)a[0], (double)a[1], (double)a[2]);
+		if (v_epsilon(a, last_a, 0.1) != motion) {
+			LOG_INF("No motion detected");
+			counts++;
+			if (counts == 2) {
+				return true;
+			}
+		} else {
+			counts = 0;
+		}
+		memcpy(last_a, a, sizeof(a));
+	}
+	LOG_INF("Motion detected");
+	return false;
+}

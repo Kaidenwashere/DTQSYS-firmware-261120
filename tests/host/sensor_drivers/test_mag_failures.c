@@ -1,0 +1,1782 @@
+#include <errno.h>
+#include <math.h>
+#include <signal.h>
+#include <stdbool.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/wait.h>
+#include <unistd.h>
+
+#include "sensor/mag/AK09940.h"
+#include "sensor/mag/BMM150.h"
+#include "sensor/mag/BMM350.h"
+#include "sensor/mag/IST8306.h"
+#include "sensor/mag/IST8308.h"
+#include "sensor/mag/LIS2MDL.h"
+#include "sensor/mag/LIS3MDL.h"
+#include "sensor/mag/MMC5603NJ.h"
+#include "sensor/mag/MMC5983MA.h"
+#include "sensor/mag/QMC5883L.h"
+#include "sensor/mag/QMC6309.h"
+
+enum fake_op_type {
+	FAKE_REG_WRITE,
+	FAKE_REG_READ,
+	FAKE_BURST_READ,
+	FAKE_BURST_READ_DUMMY,
+	FAKE_BURST_WRITE,
+	FAKE_REG_UPDATE,
+	FAKE_BURST_READ_FRAME,
+};
+
+struct fake_op {
+	enum fake_op_type type;
+	uint8_t reg;
+	uint8_t value;
+	uint8_t mask;
+	uint32_t length;
+	int64_t timestamp_us;
+};
+
+#define MAX_FAKE_OPS 512
+
+struct fake_bus {
+	struct fake_op ops[MAX_FAKE_OPS];
+	size_t op_count;
+	size_t transaction_count;
+	size_t fail_transaction;
+	uint8_t registers[256];
+	int64_t now_ms;
+	uint16_t bmm350_otp[32];
+	bool precise_clock;
+	int64_t now_us;
+	uint32_t transaction_us;
+	int64_t ready_at_us;
+	uint8_t ready_reg;
+	uint8_t ready_mask;
+	uint32_t waits_us[MAX_FAKE_OPS];
+	size_t wait_count;
+	/* Free-running hub model: frame reads may report no new acquisition. */
+	bool free_running;
+	int frame_error;
+};
+
+static struct fake_bus bus;
+static enum sensor_interface_spec fake_spec = SENSOR_INTERFACE_SPEC_I2C;
+
+#define CHECK(condition) do { \
+	if (!(condition)) { \
+		fprintf(stderr, "%s:%d: check failed: %s\n", __func__, __LINE__, #condition); \
+		return 1; \
+	} \
+} while (0)
+
+static void fake_bus_reset(void)
+{
+	memset(&bus, 0, sizeof(bus));
+	bus.now_ms = 1;
+	fake_spec = SENSOR_INTERFACE_SPEC_I2C;
+}
+
+static void fake_bus_clear_transactions(void)
+{
+	bus.op_count = 0;
+	bus.transaction_count = 0;
+	bus.fail_transaction = 0;
+}
+
+static bool fake_bus_record(
+	enum fake_op_type type,
+	uint8_t reg,
+	uint8_t value,
+	uint8_t mask,
+	uint32_t length
+)
+{
+	if (bus.op_count >= MAX_FAKE_OPS) {
+		fprintf(stderr, "fake bus operation log overflow\n");
+		abort();
+	}
+	bus.ops[bus.op_count++] = (struct fake_op) {
+		.type = type,
+		.reg = reg,
+		.value = value,
+		.mask = mask,
+		.length = length,
+		.timestamp_us = bus.precise_clock ? bus.now_us : bus.now_ms * 1000,
+	};
+	bus.transaction_count++;
+	if (bus.precise_clock) {
+		bus.now_us += bus.transaction_us;
+		if (bus.ready_at_us && bus.now_us >= bus.ready_at_us)
+			bus.registers[bus.ready_reg] |= bus.ready_mask;
+	}
+	return bus.fail_transaction == bus.transaction_count;
+}
+
+int64_t host_k_uptime_get(void)
+{
+	if (bus.precise_clock)
+		return bus.now_us / 1000;
+	return bus.now_ms++;
+}
+
+void host_k_busy_wait(uint32_t usec)
+{
+	if (bus.wait_count < MAX_FAKE_OPS)
+		bus.waits_us[bus.wait_count++] = usec;
+	if (bus.precise_clock) {
+		bus.now_us += usec;
+		return;
+	}
+	bus.now_ms += (usec + 999U) / 1000U;
+}
+
+void host_k_msleep(int32_t msec)
+{
+	if (bus.precise_clock) {
+		bus.now_us += (int64_t)msec * 1000;
+		return;
+	}
+	bus.now_ms += msec;
+}
+
+void host_k_usleep(int32_t usec)
+{
+	if (bus.wait_count < MAX_FAKE_OPS)
+		bus.waits_us[bus.wait_count++] = usec;
+	if (bus.precise_clock) {
+		bus.now_us += usec;
+		return;
+	}
+	bus.now_ms += (usec + 999) / 1000;
+}
+
+int ssi_reg_write_byte(enum sensor_interface_dev dev, uint8_t reg_addr, uint8_t value)
+{
+	(void)dev;
+	if (fake_bus_record(FAKE_REG_WRITE, reg_addr, value, 0, 1))
+		return -EIO;
+	/* Model the self-clearing reset bit needed by LIS2MDL shutdown/init. */
+	if (reg_addr == BMM350_PMU_CMD)
+		bus.registers[BMM350_PMU_CMD_STATUS_0] = (uint8_t)(value << 5);
+	if (reg_addr == BMM350_OTP_CMD_REG && (value & 0xe0) == BMM350_OTP_CMD_DIR_READ) {
+		uint16_t word = bus.bmm350_otp[value & 0x1f];
+		bus.registers[BMM350_OTP_DATA_MSB_REG] = (uint8_t)(word >> 8);
+		bus.registers[BMM350_OTP_DATA_LSB_REG] = (uint8_t)word;
+		bus.registers[BMM350_OTP_STATUS_REG] = BMM350_OTP_STATUS_CMD_DONE;
+	}
+	bus.registers[reg_addr] =
+		(reg_addr == LIS2MDL_CFG_REG_A && value == CFG_A_SOFT_RST) ? 0 : value;
+	return 0;
+}
+
+int ssi_reg_read_byte(enum sensor_interface_dev dev, uint8_t reg_addr, uint8_t *value)
+{
+	(void)dev;
+	if (fake_bus_record(FAKE_REG_READ, reg_addr, 0, 0, 1))
+		return -EIO;
+	*value = bus.registers[reg_addr];
+	return 0;
+}
+
+int ssi_burst_read(
+	enum sensor_interface_dev dev,
+	uint8_t start_addr,
+	uint8_t *buf,
+	uint32_t num_bytes
+)
+{
+	(void)dev;
+	if (fake_bus_record(FAKE_BURST_READ, start_addr, 0, 0, num_bytes))
+		return -EIO;
+	for (uint32_t i = 0; i < num_bytes; i++)
+		buf[i] = bus.registers[(uint8_t)(start_addr + i)];
+	return 0;
+}
+
+int ssi_burst_read_dummy(
+	enum sensor_interface_dev dev,
+	uint8_t start_addr,
+	uint8_t dummy_bytes,
+	uint8_t *buf,
+	uint32_t num_bytes
+)
+{
+	(void)dev;
+	if (fake_bus_record(FAKE_BURST_READ_DUMMY, start_addr, bus.registers[start_addr], dummy_bytes, num_bytes))
+		return -EIO;
+	for (uint32_t i = 0; i < num_bytes; i++)
+		buf[i] = bus.registers[(uint8_t)(start_addr + i)];
+	return 0;
+}
+
+int ssi_burst_read_frame(
+	enum sensor_interface_dev dev,
+	uint8_t start_addr,
+	uint8_t dummy_bytes,
+	uint8_t word_bytes,
+	uint8_t *buf,
+	uint32_t num_bytes
+)
+{
+	(void)dev;
+	if (fake_bus_record(FAKE_BURST_READ_FRAME, start_addr, word_bytes, dummy_bytes, num_bytes))
+		return -EIO;
+	if (bus.frame_error)
+		return bus.frame_error;
+	for (uint32_t i = 0; i < num_bytes; i++)
+		buf[i] = bus.registers[(uint8_t)(start_addr + i)];
+	return 0;
+}
+
+bool sensor_interface_mag_free_running(void)
+{
+	return bus.free_running;
+}
+
+int ssi_burst_write(
+	enum sensor_interface_dev dev,
+	uint8_t start_addr,
+	const uint8_t *buf,
+	uint32_t num_bytes
+)
+{
+	(void)dev;
+	uint8_t first = num_bytes ? buf[0] : 0;
+	if (fake_bus_record(FAKE_BURST_WRITE, start_addr, first, 0, num_bytes))
+		return -EIO;
+	for (uint32_t i = 0; i < num_bytes; i++)
+		bus.registers[(uint8_t)(start_addr + i)] = buf[i];
+	return 0;
+}
+
+int ssi_reg_update_byte(
+	enum sensor_interface_dev dev,
+	uint8_t reg_addr,
+	uint8_t mask,
+	uint8_t value
+)
+{
+	(void)dev;
+	if (fake_bus_record(FAKE_REG_UPDATE, reg_addr, value, mask, 1))
+		return -EIO;
+	bus.registers[reg_addr] = (bus.registers[reg_addr] & ~mask) | (value & mask);
+	return 0;
+}
+
+enum sensor_interface_spec sensor_interface_get_spec(enum sensor_interface_dev dev)
+{
+	(void)dev;
+	return fake_spec;
+}
+
+float mag_none_temp_read(float bias[3])
+{
+	(void)bias;
+	return NAN;
+}
+
+struct expected_write {
+	uint8_t reg;
+	uint8_t value;
+	enum fake_op_type type;
+};
+#define EXPECT_WRITE(reg_, value_) { .reg = (reg_), .value = (value_), .type = FAKE_REG_WRITE }
+#define EXPECT_READ(reg_, value_) { .reg = (reg_), .value = (value_), .type = FAKE_BURST_READ_DUMMY }
+
+struct odr_case {
+	const char *name;
+	int (*update_odr)(float, float *);
+	void (*oneshot)(void);
+	void (*shutdown)(void);
+	float requested_time;
+	float actual_time;
+	const struct expected_write *finite_writes;
+	size_t finite_write_count;
+	bool oneshot_writes;
+	bool oneshot_invalidates;
+};
+
+static const struct expected_write ak_writes[] = {
+	EXPECT_WRITE(AK09940_CNTL3, (MT_LND2 << 5) | MODE_PDM),
+	EXPECT_WRITE(AK09940_CNTL3, (MT_LND2 << 5) | MODE_CMM4_100Hz),
+};
+static const struct expected_write bmm150_writes[] = {
+	EXPECT_WRITE(BMM150_OP_CTRL, (DR_ODR_25Hz << 2 | OPMODE_NORMAL) << 1),
+	EXPECT_WRITE(BMM150_REP_XY, 4),
+	EXPECT_WRITE(BMM150_REP_Z, 14),
+};
+static const struct expected_write bmm350_writes[] = {
+	EXPECT_WRITE(BMM350_PMU_CMD_AGGR_SET, (AGGR_AVG_4 << 4) | AGGR_ODR_100Hz),
+	EXPECT_WRITE(BMM350_PMU_CMD, PMU_CMD_UPD_OAE),
+	EXPECT_READ(BMM350_PMU_CMD_STATUS_0, PMU_CMD_UPD_OAE << 5),
+	EXPECT_WRITE(BMM350_PMU_CMD, PMU_CMD_SUS),
+	EXPECT_READ(BMM350_PMU_CMD_STATUS_0, PMU_CMD_SUS << 5),
+	EXPECT_WRITE(BMM350_PMU_CMD, PMU_CMD_NM),
+	EXPECT_READ(BMM350_PMU_CMD_STATUS_0, PMU_CMD_NM << 5),
+};
+static const struct expected_write ist_writes[] = {
+	EXPECT_WRITE(IST8306_CNTL1, NSF_Low << 5),
+	EXPECT_WRITE(IST8306_CNTL2, MODE_CMM_100Hz),
+	EXPECT_WRITE(IST8306_OSRCNTL, OSR_16),
+};
+static const struct expected_write lis2_writes[] = {
+	EXPECT_WRITE(LIS2MDL_CFG_REG_C, CFG_C_BDU),
+	EXPECT_WRITE(LIS2MDL_CFG_REG_A, CFG_A_COMP_TEMP_EN | (ODR_100Hz << 2) | MD_CONTINUOUS),
+};
+static const struct expected_write lis3_writes[] = {
+	EXPECT_WRITE(LIS3MDL_CTRL_REG1, 0x80 | (OM_UHP << 5) | (1 << 1)),
+	EXPECT_WRITE(LIS3MDL_CTRL_REG3, MD_CONTINUOUS_CONV),
+	EXPECT_WRITE(LIS3MDL_CTRL_REG4, OM_UHP << 2),
+	EXPECT_WRITE(LIS3MDL_CTRL_REG5, LIS3MDL_CTRL_REG5_BDU),
+};
+static const struct expected_write mmc5603_writes[] = {
+	EXPECT_WRITE(MMC5603NJ_CONTROL_1, MBW_3_5ms),
+	EXPECT_WRITE(MMC5603NJ_ODR, 84),
+	EXPECT_WRITE(MMC5603NJ_CONTROL_0, MCTRL0_AUTO_SR_EN | MCTRL0_CMM_FREQ_EN),
+	EXPECT_WRITE(MMC5603NJ_CONTROL_2, MCTRL2_CMM_EN | MCTRL2_EN_PRD_SET | MSET_2000),
+};
+static const struct expected_write mmc5983_writes[] = {
+	EXPECT_WRITE(MMC5983MA_CONTROL_1, MBW_400Hz),
+	EXPECT_WRITE(MMC5983MA_CONTROL_2, 0x80 | (MSET_2000 << 4) | 0x08 | MODR_100Hz),
+};
+static const struct expected_write qmc5883_writes[] = {
+	EXPECT_WRITE(0x09, 0x19),
+};
+static const struct expected_write qmc6309_writes[] = {
+	EXPECT_WRITE(0x0B, 0x38),
+	EXPECT_WRITE(0x0A, 0x41),
+};
+
+static const struct odr_case odr_cases[] = {
+	{"AK09940", ak_update_odr, ak_mag_oneshot, ak_shutdown, 0.012f, 1.0f / 100, ak_writes, ARRAY_SIZE(ak_writes), true, true},
+	{"BMM150", bmm1_update_odr, bmm1_mag_oneshot, bmm1_shutdown, 0.04f, 1.0f / 25, bmm150_writes, ARRAY_SIZE(bmm150_writes), true, true},
+	{"BMM350", bmm3_update_odr, bmm3_mag_oneshot, bmm3_shutdown, 0.012f, 1.0f / 100, bmm350_writes, ARRAY_SIZE(bmm350_writes), true, true},
+	{"IST8306", ist8306_update_odr, ist8306_mag_oneshot, ist8306_shutdown, 0.012f, 1.0f / 100, ist_writes, ARRAY_SIZE(ist_writes), true, true},
+	{"IST8308", ist8308_update_odr, ist8308_mag_oneshot, ist8308_shutdown, 0.012f, 1.0f / 100, ist_writes, ARRAY_SIZE(ist_writes), true, true},
+	{"LIS2MDL", lis2_update_odr, lis2_mag_oneshot, lis2_shutdown, 0.012f, 1.0f / 100, lis2_writes, ARRAY_SIZE(lis2_writes), false, false},
+	{"LIS3MDL", lis3_update_odr, lis3_mag_oneshot, lis3_shutdown, 0.012f, 1.0f / 155, lis3_writes, ARRAY_SIZE(lis3_writes), true, true},
+	{"MMC5603NJ", mmc5603_update_odr, mmc5603_mag_oneshot, mmc5603_shutdown, 0.012f, 1.0f / 84, mmc5603_writes, ARRAY_SIZE(mmc5603_writes), true, true},
+	{"MMC5983MA", mmc_update_odr, mmc_mag_oneshot, mmc_shutdown, 0.012f, 1.0f / 100, mmc5983_writes, ARRAY_SIZE(mmc5983_writes), true, true},
+	{"QMC5883L", qmc5883l_update_odr, qmc5883l_mag_oneshot, qmc5883l_shutdown, 0.012f, 1.0f / 100, qmc5883_writes, ARRAY_SIZE(qmc5883_writes), true, true},
+	{"QMC6309", qmc_update_odr, qmc_mag_oneshot, qmc_shutdown, 0.012f, 1.0f / 100, qmc6309_writes, ARRAY_SIZE(qmc6309_writes), true, true},
+};
+
+static bool float_equal(float a, float b)
+{
+	return fabsf(a - b) < 0.000001f;
+}
+
+static int check_write_sequence(const struct expected_write *writes, size_t count)
+{
+	CHECK(bus.op_count == count);
+	for (size_t i = 0; i < count; i++) {
+		if (bus.ops[i].type != writes[i].type || bus.ops[i].reg != writes[i].reg || bus.ops[i].value != writes[i].value)
+			fprintf(stderr, "op[%zu] got type=%d reg=%02x value=%02x expected type=%d reg=%02x value=%02x\n",
+				i, bus.ops[i].type, bus.ops[i].reg, bus.ops[i].value,
+				writes[i].type, writes[i].reg, writes[i].value);
+		CHECK(bus.ops[i].type == writes[i].type);
+		CHECK(bus.ops[i].reg == writes[i].reg);
+		CHECK(bus.ops[i].value == writes[i].value);
+		CHECK(bus.ops[i].length == 1);
+	}
+	return 0;
+}
+
+static void reset_driver(const struct odr_case *test)
+{
+	/* shutdown invalidates static driver cache; do not retain its bus side effects. */
+	fake_bus_reset();
+	test->shutdown();
+	fake_bus_reset();
+}
+
+static int test_fixed_odr_case(const struct odr_case *test)
+{
+	reset_driver(test);
+	float actual = -1.0f;
+	CHECK(test->update_odr(test->requested_time, &actual) == 0);
+	CHECK(float_equal(actual, test->actual_time));
+	CHECK(check_write_sequence(test->finite_writes, test->finite_write_count) == 0);
+
+	fake_bus_clear_transactions();
+	actual = -2.0f;
+	CHECK(test->update_odr(test->requested_time, &actual) == 0);
+	CHECK(float_equal(actual, test->actual_time));
+	CHECK(bus.transaction_count == 0);
+
+	fake_bus_clear_transactions();
+	CHECK(test->update_odr(0.0f, &actual) == 0);
+	CHECK(bus.transaction_count > 0);
+	fake_bus_clear_transactions();
+	CHECK(test->update_odr(test->requested_time, &actual) == 0);
+	CHECK(float_equal(actual, test->actual_time));
+	CHECK(check_write_sequence(test->finite_writes, test->finite_write_count) == 0);
+
+	fake_bus_clear_transactions();
+	test->oneshot();
+	if (test->oneshot_writes)
+		CHECK(bus.transaction_count == (strcmp(test->name, "AK09940") == 0 ? 2U : 1U));
+	else
+		CHECK(bus.transaction_count == 0);
+	if (strcmp(test->name, "BMM150") == 0) {
+		CHECK(bus.ops[0].type == FAKE_REG_UPDATE);
+		CHECK(bus.ops[0].reg == BMM150_OP_CTRL);
+		CHECK(bus.ops[0].mask == 0x06);
+		CHECK(bus.ops[0].value == (OPMODE_FORCED << 1));
+	} else if (test->oneshot_writes) {
+		CHECK(bus.ops[0].type == FAKE_REG_WRITE);
+		CHECK(bus.ops[0].length == 1);
+	}
+	fake_bus_clear_transactions();
+	CHECK(test->update_odr(test->requested_time, &actual) == 0);
+	CHECK(float_equal(actual, test->actual_time));
+	if (test->oneshot_invalidates)
+		CHECK(check_write_sequence(test->finite_writes, test->finite_write_count) == 0);
+	else
+		CHECK(bus.transaction_count == 0);
+
+	for (size_t fail_at = 1; fail_at <= test->finite_write_count; fail_at++) {
+		reset_driver(test);
+		/* Establish another valid cached configuration before the failed change. */
+		CHECK(test->update_odr(0.1f, &actual) == 0);
+		fake_bus_clear_transactions();
+		actual = -123.0f;
+		bus.fail_transaction = fail_at;
+		CHECK(test->update_odr(test->requested_time, &actual) < 0);
+		CHECK(bus.transaction_count == fail_at);
+		CHECK(actual == -123.0f);
+
+		/* Failure invalidates even the previously valid cache entry. */
+		fake_bus_clear_transactions();
+		CHECK(test->update_odr(0.1f, &actual) == 0);
+		CHECK(bus.transaction_count == test->finite_write_count);
+
+		fake_bus_clear_transactions();
+		CHECK(test->update_odr(test->requested_time, &actual) == 0);
+		CHECK(float_equal(actual, test->actual_time));
+		CHECK(check_write_sequence(test->finite_writes, test->finite_write_count) == 0);
+	}
+	return 0;
+}
+
+static int test_all_fixed_odr_transactions(void)
+{
+	for (size_t i = 0; i < ARRAY_SIZE(odr_cases); i++) {
+		if (test_fixed_odr_case(&odr_cases[i])) {
+			fprintf(stderr, "fixed-ODR matrix failed for %s\n", odr_cases[i].name);
+			return 1;
+		}
+	}
+	return 0;
+}
+
+static size_t count_ops(enum fake_op_type type)
+{
+	size_t count = 0;
+	for (size_t i = 0; i < bus.op_count; i++)
+		count += bus.ops[i].type == type;
+	return count;
+}
+
+static int test_lis3_oneshot_timeout_stops_before_data(void)
+{
+	reset_driver(&odr_cases[6]);
+	float actual_time;
+	CHECK(lis3_update_odr(INFINITY, &actual_time) == 0);
+	lis3_mag_oneshot();
+	bus.registers[LIS3MDL_CTRL_REG3] = MD_SINGLE_CONV;
+	fake_bus_clear_transactions();
+	float m[3] = {1.0f, 2.0f, 3.0f};
+	CHECK(!lis3_mag_read(m));
+	CHECK(count_ops(FAKE_BURST_READ) == 0);
+	CHECK(m[0] == 1.0f && m[1] == 2.0f && m[2] == 3.0f);
+	return 0;
+}
+
+static int test_lis_temperatures_fail_loudly_and_apply_offset(void)
+{
+	fake_bus_reset();
+	float bias[3] = {0};
+	bus.fail_transaction = 1;
+	CHECK(isnan(lis2_temp_read(bias)));
+
+	fake_bus_reset();
+	bus.fail_transaction = 1;
+	CHECK(isnan(lis3_temp_read(bias)));
+
+	fake_bus_reset();
+	bus.registers[LIS2MDL_TEMP_OUT_L_REG] = 0x08;
+	CHECK(lis2_temp_read(bias) == 26.0f);
+
+	fake_bus_reset();
+	bus.registers[LIS3MDL_TEMP_OUT_L] = 0xf8;
+	bus.registers[LIS3MDL_TEMP_OUT_L + 1] = 0xff;
+	CHECK(lis3_temp_read(bias) == 24.0f);
+	return 0;
+}
+
+static int test_lis3_combines_status_and_data(void)
+{
+	float actual;
+	float m[3] = {1.0f, 2.0f, 3.0f};
+	reset_driver(&odr_cases[6]);
+	CHECK(lis3_update_odr(0.012f, &actual) == 0);
+	fake_bus_clear_transactions();
+	CHECK(!lis3_mag_read(m));
+	CHECK(bus.op_count == 1 && bus.ops[0].type == FAKE_BURST_READ);
+	CHECK(bus.ops[0].reg == LIS3MDL_STATUS_REG && bus.ops[0].length == 7);
+	CHECK(m[0] == 1.0f && m[1] == 2.0f && m[2] == 3.0f);
+	bus.registers[LIS3MDL_STATUS_REG] = LIS3MDL_STATUS_ZYXDA;
+	bus.registers[LIS3MDL_OUT_X_L] = 1;
+	fake_bus_clear_transactions();
+	CHECK(lis3_mag_read(m));
+	CHECK(bus.op_count == 1 && bus.ops[0].type == FAKE_BURST_READ);
+	CHECK(fabsf(m[0] - 1.0f / 3421.0f) < 0.000001f);
+	fake_spec = SENSOR_INTERFACE_SPEC_EXT;
+	bus.registers[LIS3MDL_OUT_X_L] = 2;
+	fake_bus_clear_transactions();
+	CHECK(lis3_mag_read(m));
+	CHECK(bus.op_count == 1 && bus.ops[0].reg == LIS3MDL_STATUS_REG && bus.ops[0].length == 7);
+	return 0;
+}
+
+static int test_status_plus_data_drivers_publish_only_ready(void)
+{
+	float actual;
+	float m[3] = {1.0f, 2.0f, 3.0f};
+	struct {
+		const struct odr_case *odr;
+		bool (*read_mag)(float[3]);
+		uint8_t status_reg;
+		uint8_t data_reg;
+	} cases[] = {
+		{&odr_cases[3], ist8306_mag_read, IST8306_STAT, IST8306_DATAXL},
+		{&odr_cases[4], ist8308_mag_read, IST8306_STAT, IST8306_DATAXL},
+		{&odr_cases[5], lis2_mag_read, LIS2MDL_STATUS_REG, LIS2MDL_OUTX_L_REG},
+	};
+	for (size_t i = 0; i < ARRAY_SIZE(cases); i++) {
+		reset_driver(cases[i].odr);
+		CHECK(cases[i].odr->update_odr(cases[i].odr->requested_time, &actual) == 0);
+		fake_bus_clear_transactions();
+		CHECK(!cases[i].read_mag(m));
+		CHECK(bus.op_count == 1 && bus.ops[0].type == FAKE_BURST_READ);
+		CHECK(bus.ops[0].reg == cases[i].status_reg && bus.ops[0].length == 7);
+		bus.registers[cases[i].status_reg] = 0x09;
+		bus.registers[cases[i].data_reg] = (uint8_t)(i + 1);
+		fake_bus_clear_transactions();
+		CHECK(cases[i].read_mag(m));
+		CHECK(bus.op_count == 1 && bus.ops[0].type == FAKE_BURST_READ);
+		fake_spec = SENSOR_INTERFACE_SPEC_EXT;
+		bus.registers[cases[i].data_reg]++;
+		fake_bus_clear_transactions();
+		CHECK(cases[i].read_mag(m));
+		CHECK(bus.op_count == 1 && bus.ops[0].reg == cases[i].status_reg && bus.ops[0].length == 7);
+	}
+	return 0;
+}
+
+static bool vector_is(const float m[3], float x, float y, float z)
+{
+	return m[0] == x && m[1] == y && m[2] == z;
+}
+
+static int test_free_running_status_frames_ignore_consumed_ready(void)
+{
+	float actual;
+	struct {
+		const struct odr_case *odr;
+		bool (*read_mag)(float[3]);
+		uint8_t status_reg;
+		uint8_t data_reg;
+		uint32_t length;
+	} cases[] = {
+		{&odr_cases[0], ak_mag_read, AK09940_ST1, AK09940_HXL, 12},
+		{&odr_cases[3], ist8306_mag_read, IST8306_STAT, IST8306_DATAXL, 7},
+		{&odr_cases[4], ist8308_mag_read, IST8306_STAT, IST8306_DATAXL, 7},
+		{&odr_cases[5], lis2_mag_read, LIS2MDL_STATUS_REG, LIS2MDL_OUTX_L_REG, 7},
+		{&odr_cases[6], lis3_mag_read, LIS3MDL_STATUS_REG, LIS3MDL_OUT_X_L, 7},
+	};
+	for (size_t i = 0; i < ARRAY_SIZE(cases); i++) {
+		reset_driver(cases[i].odr);
+		bus.free_running = true;
+		fake_spec = SENSOR_INTERFACE_SPEC_EXT;
+		float m[3] = {1.0f, 2.0f, 3.0f};
+		CHECK(!cases[i].read_mag(m));
+		CHECK(bus.op_count == 0);
+		CHECK(cases[i].odr->update_odr(cases[i].odr->requested_time, &actual) == 0);
+
+		/* The hub's own reads already cleared the ready bit. */
+		bus.registers[cases[i].status_reg] = 0;
+		bus.registers[cases[i].data_reg] = 1;
+		fake_bus_clear_transactions();
+		CHECK(cases[i].read_mag(m));
+		CHECK(bus.op_count == 1 && bus.ops[0].type == FAKE_BURST_READ_FRAME);
+		CHECK(bus.ops[0].reg == cases[i].status_reg && bus.ops[0].length == cases[i].length);
+		CHECK(bus.ops[0].mask == 0 && bus.ops[0].value == 1);
+		CHECK(!vector_is(m, 1.0f, 2.0f, 3.0f));
+
+		m[0] = 1.0f; m[1] = 2.0f; m[2] = 3.0f;
+		CHECK(!cases[i].read_mag(m));
+		bus.registers[cases[i].data_reg] = 2;
+		bus.frame_error = -EAGAIN;
+		CHECK(!cases[i].read_mag(m));
+		CHECK(vector_is(m, 1.0f, 2.0f, 3.0f));
+		bus.frame_error = 0;
+		CHECK(cases[i].read_mag(m));
+		/* A genuinely static field still publishes once the sample is overdue. */
+		CHECK(!cases[i].read_mag(m));
+		bus.now_ms += 1000;
+		CHECK(cases[i].read_mag(m));
+
+		CHECK(cases[i].odr->update_odr(0.0f, &actual) == 0);
+		fake_bus_clear_transactions();
+		CHECK(!cases[i].read_mag(m));
+		CHECK(bus.op_count == 0);
+	}
+	return 0;
+}
+
+static int test_bmm350_free_running_reads_xyz_frames(void)
+{
+	fake_bus_reset();
+	bus.registers[BMM350_CHIP_ID_REG] = BMM350_CHIP_ID;
+	bus.free_running = true;
+	fake_spec = SENSOR_INTERFACE_SPEC_EXT;
+	float actual;
+	CHECK(bmm3_init(0.01f, &actual) == 0);
+	bus.registers[BMM350_INT_STATUS] = 0;
+	bus.registers[BMM350_MAG_X_XLSB] = 10;
+	fake_bus_clear_transactions();
+	float m[3] = {1, 2, 3};
+	CHECK(bmm3_mag_read(m));
+	CHECK(m[0] > 0 && m[1] == 0 && m[2] == 0);
+	CHECK(bus.op_count == 2);
+	CHECK(bus.ops[0].type == FAKE_BURST_READ_FRAME && bus.ops[0].reg == BMM350_MAG_X_XLSB);
+	CHECK(bus.ops[0].mask == 2 && bus.ops[0].value == 3 && bus.ops[0].length == 9);
+	CHECK(bus.ops[1].type == FAKE_BURST_READ_DUMMY && bus.ops[1].reg == BMM350_TEMP_XLSB);
+	CHECK(bus.ops[1].mask == 2 && bus.ops[1].length == 3);
+
+	m[0] = 1;
+	fake_bus_clear_transactions();
+	CHECK(!bmm3_mag_read(m));
+	CHECK(bus.op_count == 1 && m[0] == 1);
+
+	/* Temperature is refreshed on its own cadence, not per frame. */
+	bus.registers[BMM350_MAG_X_XLSB] = 20;
+	fake_bus_clear_transactions();
+	CHECK(bmm3_mag_read(m));
+	CHECK(bus.op_count == 1);
+	bus.now_ms += 1000;
+	bus.registers[BMM350_MAG_X_XLSB] = 30;
+	fake_bus_clear_transactions();
+	bus.fail_transaction = 2;
+	CHECK(bmm3_mag_read(m));
+	CHECK(bus.op_count == 2);
+	bus.registers[BMM350_MAG_X_XLSB] = 40;
+	fake_bus_clear_transactions();
+	CHECK(bmm3_mag_read(m));
+	CHECK(bus.op_count == 2 && bus.ops[1].reg == BMM350_TEMP_XLSB);
+
+	bus.registers[BMM350_MAG_X_XLSB] = 50;
+	bus.frame_error = -EAGAIN;
+	m[0] = 1;
+	CHECK(!bmm3_mag_read(m));
+	CHECK(m[0] == 1);
+	bus.frame_error = 0;
+
+	CHECK(bmm3_update_odr(INFINITY, &actual) == 0);
+	fake_bus_clear_transactions();
+	CHECK(!bmm3_mag_read(m));
+	CHECK(bus.op_count == 0);
+	return 0;
+}
+
+static int test_mmc_continuous_frames_drop_repeats(void)
+{
+	static const struct {
+		size_t driver;
+		bool (*read)(float *);
+		uint8_t data_reg;
+		uint32_t length;
+	} cases[] = {
+		{7, mmc5603_mag_read, MMC5603NJ_XOUT_0, 9},
+		{8, mmc_mag_read, MMC5983MA_XOUT_0, 7},
+	};
+	for (size_t i = 0; i < ARRAY_SIZE(cases); i++) {
+		for (int free_running = 0; free_running < 2; free_running++) {
+			const struct odr_case *odr = &odr_cases[cases[i].driver];
+			reset_driver(odr);
+			bus.free_running = free_running;
+			fake_spec = free_running ? SENSOR_INTERFACE_SPEC_EXT : SENSOR_INTERFACE_SPEC_I2C;
+			float actual;
+			float m[3] = {1, 2, 3};
+			CHECK(!cases[i].read(m));
+			CHECK(bus.op_count == 0);
+			CHECK(odr->update_odr(odr->requested_time, &actual) == 0);
+
+			bus.registers[cases[i].data_reg] = 0x81;
+			fake_bus_clear_transactions();
+			CHECK(cases[i].read(m));
+			CHECK(bus.op_count == 1 && bus.ops[0].type == FAKE_BURST_READ_FRAME);
+			CHECK(bus.ops[0].reg == cases[i].data_reg && bus.ops[0].length == cases[i].length);
+			CHECK(bus.ops[0].mask == 0 && bus.ops[0].value == 1);
+			CHECK(!vector_is(m, 1, 2, 3));
+
+			m[0] = 1; m[1] = 2; m[2] = 3;
+			CHECK(!cases[i].read(m));
+			CHECK(vector_is(m, 1, 2, 3));
+			bus.registers[cases[i].data_reg] = 0x82;
+			CHECK(cases[i].read(m));
+			bus.now_ms += 1000;
+			CHECK(cases[i].read(m));
+
+			CHECK(odr->update_odr(INFINITY, &actual) == 0);
+			fake_bus_clear_transactions();
+			CHECK(!cases[i].read(m));
+			CHECK(bus.op_count == 0);
+		}
+	}
+	return 0;
+}
+
+static int test_mmc5603_integer_odr_and_bandwidth(void)
+{
+	static const struct {
+		float hz;
+		uint8_t odr;
+		uint8_t bandwidth;
+		uint8_t high_power;
+		float actual_hz;
+	} cases[] = {
+		{0.5f, 1, MBW_6_6ms, 0, 1},
+		{75, 75, MBW_6_6ms, 0, 75},
+		{75.5f, 76, MBW_3_5ms, 0, 76},
+		{1 / 0.012f, 84, MBW_3_5ms, 0, 84},
+		{150, 150, MBW_3_5ms, 0, 150},
+		{200, 200, MBW_2_0ms, 0, 200},
+		{255, 255, MBW_2_0ms, 0, 255},
+		{300, 255, MBW_1_2ms, MCTRL2_HPOWER, 1000},
+		{2000, 255, MBW_1_2ms, MCTRL2_HPOWER, 1000},
+	};
+	for (size_t i = 0; i < ARRAY_SIZE(cases); i++) {
+		reset_driver(&odr_cases[7]);
+		float actual = -1;
+		CHECK(mmc5603_update_odr(1.0f / cases[i].hz, &actual) == 0);
+		CHECK(float_equal(actual, 1.0f / cases[i].actual_hz));
+		CHECK(bus.registers[MMC5603NJ_CONTROL_1] == cases[i].bandwidth);
+		CHECK(bus.registers[MMC5603NJ_ODR] == cases[i].odr);
+		CHECK(bus.registers[MMC5603NJ_CONTROL_2] ==
+			(cases[i].high_power | MCTRL2_CMM_EN | MCTRL2_EN_PRD_SET | MSET_2000));
+	}
+	return 0;
+}
+
+static int test_bmm150_direct_status_gate(void)
+{
+	float actual;
+	float m[3] = {1.0f, 2.0f, 3.0f};
+	reset_driver(&odr_cases[1]);
+	CHECK(bmm1_update_odr(0.04f, &actual) == 0);
+	fake_bus_clear_transactions();
+	CHECK(!bmm1_mag_read(m));
+	CHECK(bus.op_count == 1 && bus.ops[0].type == FAKE_REG_READ);
+	CHECK(count_ops(FAKE_BURST_READ_FRAME) == 0);
+	bus.registers[BMM150_DATA_READY_STATUS] = BMM150_DATA_READY_MASK;
+	CHECK(bmm1_mag_read(m));
+	CHECK(count_ops(FAKE_BURST_READ_FRAME) == 1);
+	fake_spec = SENSOR_INTERFACE_SPEC_EXT;
+	bus.registers[BMM150_DATAX_LSB]++;
+	fake_bus_clear_transactions();
+	CHECK(bmm1_mag_read(m));
+	CHECK(bus.op_count == 1 && bus.ops[0].type == FAKE_BURST_READ_FRAME);
+	return 0;
+}
+
+static int test_status_less_hub_frames_do_not_wait(void)
+{
+	static const struct {
+		size_t driver;
+		bool (*read)(float *);
+		uint8_t data_reg;
+		uint32_t length;
+	} cases[] = {
+		{1, bmm1_mag_read, BMM150_DATAX_LSB, 8},
+		{9, qmc5883l_mag_read, 0x00, 6},
+		{10, qmc_mag_read, 0x01, 6},
+	};
+	for (size_t i = 0; i < ARRAY_SIZE(cases); i++) {
+		const struct odr_case *odr = &odr_cases[cases[i].driver];
+		reset_driver(odr);
+		float actual;
+		CHECK(odr->update_odr(odr->requested_time, &actual) == 0);
+		bus.free_running = true;
+		fake_spec = SENSOR_INTERFACE_SPEC_EXT;
+		bus.registers[cases[i].data_reg] = 1;
+
+		/* No completed hub acquisition yet: one probe, no data, no wait. */
+		bus.frame_error = -EAGAIN;
+		fake_bus_clear_transactions();
+		float m[3] = {1, 2, 3};
+		CHECK(!cases[i].read(m));
+		CHECK(bus.op_count == 1 && bus.ops[0].type == FAKE_BURST_READ_FRAME);
+		CHECK(bus.ops[0].reg == cases[i].data_reg && bus.ops[0].length == cases[i].length);
+		CHECK(bus.ops[0].mask == 0 && bus.ops[0].value == 2);
+		CHECK(bus.wait_count == 0);
+		CHECK(vector_is(m, 1, 2, 3));
+
+		bus.frame_error = 0;
+		CHECK(cases[i].read(m));
+		CHECK(!vector_is(m, 1, 2, 3));
+	}
+	return 0;
+}
+
+static void bmm150_frame(const int16_t axes[3])
+{
+	for (unsigned axis = 0; axis < 3; axis++) {
+		uint16_t packed = (uint16_t)((int32_t)axes[axis] * (axis == 2 ? 2 : 8));
+		bus.registers[BMM150_DATAX_LSB + axis * 2] = (uint8_t)packed;
+		bus.registers[BMM150_DATAX_LSB + axis * 2 + 1] = (uint8_t)(packed >> 8);
+	}
+	bus.registers[BMM150_RHALL_LSB] = BMM150_DATA_READY_MASK;
+	bus.registers[BMM150_RHALL_LSB + 1] = 0x80;
+}
+
+static bool bmm150_read_mode(unsigned mode, float out[3])
+{
+	fake_spec = mode == 1 ? SENSOR_INTERFACE_SPEC_EXT : SENSOR_INTERFACE_SPEC_I2C;
+	if (mode == 2) {
+		bmm1_mag_oneshot();
+		bus.registers[BMM150_OP_CTRL] &= (uint8_t)~0x06;
+	}
+	return bmm1_mag_read(out);
+}
+
+static int test_bmm150_overflow_is_not_published(void)
+{
+	const int16_t ordinary[3] = {100, -200, 300};
+	const int16_t overflow[3] = {-4096, -4096, -16384};
+	const int16_t neighbors[3][2] = {{-4095, 4095}, {-4095, 4095}, {-16383, 16383}};
+	const float expected_neighbors[3][2] = {
+		{-12.796875f, 12.796875f}, {-12.796875f, 12.796875f}, {-27.305f, 27.305f},
+	};
+	const float expected_ordinary[3] = {0.3125f, -0.625f, 0.5f};
+	float actual;
+	fake_bus_reset();
+	/* Fixed trim and RHALL values make the compensated vector deterministic. */
+	bus.registers[BMM150_DIG_Z2_LSB + 1] = 0x20;
+	bus.registers[BMM150_DIG_Z2_LSB + 3] = 0x40;
+	bus.registers[BMM150_DIG_Z2_LSB + 5] = 0x20;
+	CHECK(bmm1_init(0.04f, &actual) == 0);
+
+	for (unsigned mode = 0; mode < 3; mode++) {
+		for (unsigned axis = 0; axis < 3; axis++) {
+			int16_t axes[3];
+			memcpy(axes, ordinary, sizeof(axes));
+			axes[axis] = overflow[axis];
+			bmm150_frame(axes);
+			bus.registers[BMM150_DATAX_LSB + axis * 2] |= axis == 2 ? 0x01 : 0x07;
+			float out[3] = {11.0f, 22.0f, 33.0f};
+			CHECK(!bmm150_read_mode(mode, out));
+			CHECK(out[0] == 11.0f && out[1] == 22.0f && out[2] == 33.0f);
+
+			for (unsigned side = 0; side < 2; side++) {
+				axes[axis] = neighbors[axis][side];
+				bmm150_frame(axes);
+				CHECK(bmm150_read_mode(mode, out));
+				for (unsigned component = 0; component < 3; component++) {
+					float expected = component == axis ? expected_neighbors[axis][side]
+									 : expected_ordinary[component];
+					CHECK(fabsf(out[component] - expected) < 0.00001f);
+				}
+			}
+		}
+	}
+	return 0;
+}
+
+static bool contains_write(uint8_t reg, uint8_t value);
+static int test_bmm350_init_and_compensation(void)
+{
+	fake_bus_reset();
+	bus.registers[BMM350_CHIP_ID_REG] = BMM350_CHIP_ID;
+	/* Deterministic OTP vector exercises signed offset/sensitivity/cross-axis parsing. */
+	bus.bmm350_otp[0x0d] = 0x0205;
+	bus.bmm350_otp[0x0e] = 0xf064;
+	bus.bmm350_otp[0x0f] = 0x0320;
+	bus.bmm350_otp[0x10] = 0x0104;
+	bus.bmm350_otp[0x11] = 0xfe02;
+	bus.bmm350_otp[0x12] = 0x0102;
+	bus.bmm350_otp[0x13] = 0xfffe;
+	bus.bmm350_otp[0x14] = 0x0201;
+	bus.bmm350_otp[0x15] = 0x01ff;
+	bus.bmm350_otp[0x16] = 0xff01;
+	bus.bmm350_otp[0x18] = 0x0200;
+	float actual = -1.0f;
+	CHECK(bmm3_init(0.01f, &actual) == 0);
+	CHECK(float_equal(actual, 0.01f));
+	CHECK(bus.ops[0].type == FAKE_REG_WRITE && bus.ops[0].reg == BMM350_CMD);
+	CHECK(bus.ops[0].value == BMM350_CMD_SOFTRESET);
+	CHECK(contains_write(BMM350_OTP_CMD_REG, BMM350_OTP_CMD_PWR_OFF));
+	CHECK(contains_write(BMM350_PMU_CMD_AXIS_EN, BMM350_AXIS_EN_XYZ));
+	CHECK(contains_write(BMM350_INT_CTRL, 0x86));
+	CHECK(contains_write(BMM350_PMU_CMD, PMU_CMD_UPD_OAE));
+	CHECK(contains_write(BMM350_PMU_CMD, PMU_CMD_NM));
+
+	bus.registers[BMM350_INT_STATUS] = BMM350_DRDY_DATA_REG;
+	bus.registers[BMM350_MAG_X_XLSB] = 1;
+	bus.registers[BMM350_TEMP_XLSB] = 0;
+	float m[3] = {0};
+	CHECK(bmm3_mag_read(m));
+	CHECK(isfinite(m[0]) && isfinite(m[1]) && isfinite(m[2]));
+	CHECK(fabsf(m[0]) > 0.1f);
+	CHECK(fabsf(m[0] - 0.9698315f) < 0.00001f);
+	CHECK(fabsf(m[1] + 2.2043101f) < 0.00001f);
+	CHECK(fabsf(m[2] - 7.7091193f) < 0.00001f);
+	CHECK(fabsf(bmm3_temp_read(NULL) + 24.5895703f) < 0.00001f);
+	fake_bus_reset();
+	bus.registers[BMM350_CHIP_ID_REG] = BMM350_CHIP_ID;
+	bus.fail_transaction = 1;
+	actual = -123.0f;
+	CHECK(bmm3_init(0.01f, &actual) < 0);
+	CHECK(actual == -123.0f);
+	CHECK(!bmm3_mag_read(m));
+	return 0;
+}
+
+static int test_mmc_timeouts_stop_before_data(void)
+{
+	float actual_time;
+	float m[3] = {1.0f, 2.0f, 3.0f};
+
+	reset_driver(&odr_cases[7]);
+	CHECK(mmc5603_update_odr(INFINITY, &actual_time) == 0);
+	mmc5603_mag_oneshot();
+	fake_bus_clear_transactions();
+	CHECK(!mmc5603_mag_read(m));
+	CHECK(count_ops(FAKE_BURST_READ) == 0);
+	CHECK(m[0] == 1.0f && m[1] == 2.0f && m[2] == 3.0f);
+
+	reset_driver(&odr_cases[8]);
+	CHECK(mmc_update_odr(INFINITY, &actual_time) == 0);
+	mmc_mag_oneshot();
+	fake_bus_clear_transactions();
+	CHECK(!mmc_mag_read(m));
+	CHECK(count_ops(FAKE_BURST_READ) == 0);
+	CHECK(m[0] == 1.0f && m[1] == 2.0f && m[2] == 3.0f);
+	return 0;
+}
+
+static int test_mmc_temperature_failures_do_not_publish_bias(void)
+{
+	float bias[3] = {4.0f, 5.0f, 6.0f};
+	fake_bus_reset();
+	bus.fail_transaction = 1;
+	CHECK(isnan(mmc5603_temp_read(bias)));
+	CHECK(bias[0] == 4.0f && bias[1] == 5.0f && bias[2] == 6.0f);
+
+	fake_bus_reset();
+	bus.fail_transaction = 1;
+	CHECK(isnan(mmc_temp_read(bias)));
+	CHECK(bias[0] == 4.0f && bias[1] == 5.0f && bias[2] == 6.0f);
+	return 0;
+}
+
+static int test_qmc_timeouts_stop_before_data(void)
+{
+	float actual_time;
+	float m[3] = {1.0f, 2.0f, 3.0f};
+
+	reset_driver(&odr_cases[9]);
+	CHECK(qmc5883l_update_odr(INFINITY, &actual_time) == 0);
+	qmc5883l_mag_oneshot();
+	fake_bus_clear_transactions();
+	CHECK(!qmc5883l_mag_read(m));
+	CHECK(count_ops(FAKE_BURST_READ) == 0);
+	CHECK(m[0] == 1.0f && m[1] == 2.0f && m[2] == 3.0f);
+
+	reset_driver(&odr_cases[10]);
+	CHECK(qmc_update_odr(INFINITY, &actual_time) == 0);
+	qmc_mag_oneshot();
+	fake_bus_clear_transactions();
+	CHECK(!qmc_mag_read(m));
+	CHECK(count_ops(FAKE_BURST_READ) == 0);
+	CHECK(m[0] == 1.0f && m[1] == 2.0f && m[2] == 3.0f);
+	return 0;
+}
+
+static int test_qmc_trigger_and_burst_failures_are_not_published(void)
+{
+	float actual_time;
+	float m[3] = {1.0f, 2.0f, 3.0f};
+	reset_driver(&odr_cases[9]);
+	CHECK(qmc5883l_update_odr(INFINITY, &actual_time) == 0);
+	fake_bus_clear_transactions();
+	bus.fail_transaction = 1;
+	qmc5883l_mag_oneshot();
+	bus.registers[0x06] = 0x01;
+	CHECK(!qmc5883l_mag_read(m));
+	CHECK(count_ops(FAKE_BURST_READ) == 0);
+
+	reset_driver(&odr_cases[9]);
+	CHECK(qmc5883l_update_odr(0.02f, &actual_time) == 0);
+	fake_bus_clear_transactions();
+	bus.fail_transaction = 1;
+	CHECK(!qmc5883l_mag_read(m));
+	CHECK(m[0] == 1.0f && m[1] == 2.0f && m[2] == 3.0f);
+	return 0;
+}
+
+static int test_qmc_oneshot_overflow_is_not_published(void)
+{
+	float actual_time;
+	float m[3] = {1.0f, 2.0f, 3.0f};
+	reset_driver(&odr_cases[9]);
+	CHECK(qmc5883l_update_odr(INFINITY, &actual_time) == 0);
+	qmc5883l_mag_oneshot();
+	bus.registers[0x06] = 0x03;
+	CHECK(!qmc5883l_mag_read(m));
+	CHECK(count_ops(FAKE_BURST_READ) == 0);
+
+	reset_driver(&odr_cases[10]);
+	CHECK(qmc_update_odr(INFINITY, &actual_time) == 0);
+	qmc_mag_oneshot();
+	bus.registers[0x09] = 0x03;
+	CHECK(!qmc_mag_read(m));
+	CHECK(count_ops(FAKE_BURST_READ) == 0);
+	return 0;
+}
+
+static int test_ak09940_rejects_invalid_frames(void)
+{
+	float actual_time;
+	float m[3] = {1.0f, 2.0f, 3.0f};
+	reset_driver(&odr_cases[0]);
+	CHECK(ak_update_odr(0.01f, &actual_time) == 0);
+
+	fake_bus_clear_transactions();
+	CHECK(!ak_mag_read(m));
+	CHECK(bus.op_count == 1 && bus.ops[0].type == FAKE_BURST_READ);
+	CHECK(bus.ops[0].reg == AK09940_ST1 && bus.ops[0].length == 12);
+	CHECK(m[0] == 1.0f && m[1] == 2.0f && m[2] == 3.0f);
+
+	bus.registers[AK09940_ST1] = AK09940_ST1_DRDY;
+	bus.registers[AK09940_ST2] = AK09940_ST2_INV;
+	CHECK(!ak_mag_read(m));
+	bus.registers[AK09940_ST2] = AK09940_ST2_INV | AK09940_ST2_DOR;
+	CHECK(!ak_mag_read(m));
+	CHECK(m[0] == 1 && m[1] == 2 && m[2] == 3);
+	bus.registers[AK09940_ST2] = AK09940_ST2_DOR;
+	bus.registers[AK09940_HXL] = 10;
+	CHECK(ak_mag_read(m));
+	CHECK(fabsf(m[0] - 0.001f) < 0.000001f && m[1] == 0 && m[2] == 0);
+
+	bus.registers[AK09940_ST2] = 0;
+	bus.registers[AK09940_HXL] = 0xff;
+	bus.registers[AK09940_HXL + 1] = 0xff;
+	bus.registers[AK09940_HXL + 2] = 0x01;
+	CHECK(!ak_mag_read(m));
+
+	uint8_t negative_18bit[9] = {0x00, 0x00, 0x02};
+	ak_mag_process(negative_18bit, m);
+	CHECK(fabsf(m[0] + 13.1072f) < 0.0001f);
+	uint8_t minus_one[9] = {0xff, 0xff, 0x03};
+	ak_mag_process(minus_one, m);
+	CHECK(fabsf(m[0] + 0.0001f) < 0.000001f);
+	return 0;
+}
+
+static int test_qmc_direct_status_gate_and_variant_odr(void)
+{
+	float actual = -1.0f;
+	float m[3] = {1.0f, 2.0f, 3.0f};
+
+	reset_driver(&odr_cases[10]);
+	qmc_set_variant(false);
+	CHECK(qmc_update_odr(0.25f, &actual) == 0);
+	CHECK(float_equal(actual, 0.1f));
+	CHECK(bus.ops[0].type == FAKE_REG_WRITE && bus.ops[0].reg == 0x0B && bus.ops[0].value == 0x18);
+
+	fake_bus_clear_transactions();
+	qmc_set_variant(true);
+	CHECK(qmc_update_odr(0.25f, &actual) == 0);
+	CHECK(float_equal(actual, 1.0f / 50));
+	CHECK(bus.ops[0].type == FAKE_REG_WRITE && bus.ops[0].reg == 0x0B && bus.ops[0].value == 0x28);
+	fake_bus_clear_transactions();
+	CHECK(!qmc_mag_read(m));
+	CHECK(bus.op_count == 1 && bus.ops[0].type == FAKE_REG_READ);
+	CHECK(count_ops(FAKE_BURST_READ_FRAME) == 0);
+	bus.registers[0x09] = 0x02;
+	CHECK(!qmc_mag_read(m));
+	CHECK(count_ops(FAKE_BURST_READ_FRAME) == 0);
+	bus.registers[0x09] = 0x01;
+	CHECK(qmc_mag_read(m));
+	CHECK(count_ops(FAKE_BURST_READ_FRAME) == 1);
+
+	bus.registers[0x01] = 1;
+	fake_spec = SENSOR_INTERFACE_SPEC_EXT;
+	fake_bus_clear_transactions();
+	CHECK(qmc_mag_read(m));
+	CHECK(bus.op_count == 1 && bus.ops[0].type == FAKE_BURST_READ_FRAME);
+
+	reset_driver(&odr_cases[9]);
+	CHECK(qmc5883l_update_odr(0.02f, &actual) == 0);
+	fake_bus_clear_transactions();
+	CHECK(!qmc5883l_mag_read(m));
+	CHECK(count_ops(FAKE_BURST_READ_FRAME) == 0);
+	bus.registers[0x06] = 0x02;
+	CHECK(!qmc5883l_mag_read(m));
+	CHECK(count_ops(FAKE_BURST_READ_FRAME) == 0);
+	bus.registers[0x06] = 0x01;
+	CHECK(qmc5883l_mag_read(m));
+	CHECK(count_ops(FAKE_BURST_READ_FRAME) == 1);
+
+	bus.registers[0x00] = 2;
+	fake_spec = SENSOR_INTERFACE_SPEC_EXT;
+	fake_bus_clear_transactions();
+	CHECK(qmc5883l_mag_read(m));
+	CHECK(bus.op_count == 1 && bus.ops[0].type == FAKE_BURST_READ_FRAME);
+	return 0;
+}
+
+
+static int test_qmc_raw_decode_allows_unaligned_input(void)
+{
+	_Alignas(2) uint8_t raw[7] = {0, 0x34, 0x12, 0xcc, 0xff, 0x00, 0x80};
+	float m[3];
+	qmc5883l_mag_process(&raw[1], m);
+	CHECK(fabsf(m[0] - (4660.0f / 3000.0f)) < 0.00001f);
+	CHECK(fabsf(m[1] - (-52.0f / 3000.0f)) < 0.00001f);
+	CHECK(fabsf(m[2] - (-32768.0f / 3000.0f)) < 0.00001f);
+	qmc_mag_process(&raw[1], m);
+	CHECK(fabsf(m[0] - (4660.0f / 4000.0f)) < 0.00001f);
+	CHECK(fabsf(m[1] - (-52.0f / 4000.0f)) < 0.00001f);
+	CHECK(fabsf(m[2] - (-32768.0f / 4000.0f)) < 0.00001f);
+	return 0;
+}
+
+static bool contains_write(uint8_t reg, uint8_t value)
+{
+	for (size_t i = 0; i < bus.op_count; i++) {
+		if (bus.ops[i].type == FAKE_REG_WRITE &&
+			bus.ops[i].reg == reg && bus.ops[i].value == value)
+			return true;
+	}
+	return false;
+}
+
+static int test_mmc5603_calibration_restores_control(void)
+{
+	const struct odr_case *test = &odr_cases[7];
+	reset_driver(test);
+	float actual;
+	CHECK(mmc5603_update_odr(0.1f, &actual) == 0);
+	bus.registers[MMC5603NJ_TOUT] = 42;
+	bus.registers[MMC5603NJ_STATUS] = MSTAT_MEAS_M_DONE;
+	fake_bus_clear_transactions();
+	float bias[3] = {1.0f, 2.0f, 3.0f};
+	CHECK(!isnan(mmc5603_temp_read(bias)));
+	CHECK(contains_write(MMC5603NJ_ODR, 10));
+	CHECK(contains_write(MMC5603NJ_CONTROL_0, MCTRL0_AUTO_SR_EN | MCTRL0_CMM_FREQ_EN));
+	CHECK(contains_write(MMC5603NJ_CONTROL_2,
+		MCTRL2_CMM_EN | MCTRL2_EN_PRD_SET | MSET_2000));
+	CHECK(bus.ops[bus.op_count - 1].type == FAKE_REG_WRITE);
+	CHECK(bus.ops[bus.op_count - 1].reg == MMC5603NJ_CONTROL_0);
+	CHECK(bus.ops[bus.op_count - 1].value == (MCTRL0_AUTO_SR_EN | MCTRL0_TAKE_MEAS_T));
+	fake_bus_clear_transactions();
+	CHECK(mmc5603_update_odr(0.1f, &actual) == 0);
+	CHECK(bus.transaction_count == 0);
+	return 0;
+}
+
+static int test_mmc5983_calibration_restores_control(void)
+{
+	const struct odr_case *test = &odr_cases[8];
+	reset_driver(test);
+	float actual;
+	CHECK(mmc_update_odr(0.1f, &actual) == 0);
+	bus.registers[MMC5983MA_TOUT] = 42;
+	bus.registers[MMC5983MA_STATUS] = 0x01;
+	fake_bus_clear_transactions();
+	float bias[3] = {1.0f, 2.0f, 3.0f};
+	CHECK(!isnan(mmc_temp_read(bias)));
+	CHECK(contains_write(MMC5983MA_CONTROL_1, MBW_100Hz));
+	CHECK(contains_write(MMC5983MA_CONTROL_2,
+		0x80 | (MSET_2000 << 4) | 0x08 | MODR_10Hz));
+	CHECK(bus.ops[bus.op_count - 1].type == FAKE_REG_WRITE);
+	CHECK(bus.ops[bus.op_count - 1].reg == MMC5983MA_CONTROL_0);
+	CHECK(bus.ops[bus.op_count - 1].value == 0x22);
+	fake_bus_clear_transactions();
+	CHECK(mmc_update_odr(0.1f, &actual) == 0);
+	CHECK(bus.transaction_count == 0);
+	return 0;
+}
+
+static int test_ist8308_init_programs_drive_rate_first(void)
+{
+	fake_bus_reset();
+	ist8308_shutdown();
+	fake_bus_reset();
+	float actual = -1.0f;
+	CHECK(ist8308_init(0.012f, &actual) == 0);
+	CHECK(float_equal(actual, 1.0f / 100));
+	CHECK(bus.op_count == 4);
+	CHECK(bus.ops[0].type == FAKE_REG_WRITE);
+	CHECK(bus.ops[0].reg == 0x34);
+	CHECK(bus.ops[0].value == DR_200);
+	CHECK(bus.ops[1].reg == IST8306_CNTL1);
+	CHECK(bus.ops[2].reg == IST8306_CNTL2);
+	CHECK(bus.ops[3].reg == IST8306_OSRCNTL);
+	return 0;
+}
+
+static int test_modes_ak_powerdown_transitions(void)
+{
+	reset_driver(&odr_cases[0]);
+	bus.precise_clock = true;
+	float actual = -1;
+	CHECK(ak_update_odr(0.01f, &actual) == 0);
+	CHECK(bus.op_count == 2);
+	CHECK(bus.ops[0].value == ((MT_LND2 << 5) | MODE_PDM));
+	CHECK(bus.ops[1].value == ((MT_LND2 << 5) | MODE_CMM4_100Hz));
+	CHECK(bus.ops[1].timestamp_us - bus.ops[0].timestamp_us >= 100);
+	CHECK(bus.wait_count == 1 && bus.waits_us[0] == 100);
+	fake_bus_clear_transactions();
+	CHECK(ak_update_odr(0.01f, &actual) == 0);
+	CHECK(bus.op_count == 0);
+	CHECK(ak_update_odr(0.02f, &actual) == 0);
+	CHECK(bus.op_count == 2 && bus.ops[1].timestamp_us - bus.ops[0].timestamp_us >= 100);
+	fake_bus_clear_transactions();
+	CHECK(ak_update_odr(INFINITY, &actual) == 0);
+	CHECK(actual == 0 && bus.op_count == 1);
+	CHECK(bus.ops[0].value == ((MT_LND2 << 5) | MODE_PDM));
+	fake_bus_clear_transactions();
+	ak_mag_oneshot();
+	CHECK(bus.op_count == 2);
+	CHECK(bus.ops[1].value == ((MT_LND2 << 5) | MODE_SMM));
+	CHECK(bus.ops[1].timestamp_us - bus.ops[0].timestamp_us >= 100);
+	for (size_t fail = 1; fail <= 2; fail++) {
+		fake_bus_clear_transactions();
+		bus.fail_transaction = fail;
+		ak_mag_oneshot();
+		CHECK(bus.transaction_count == fail);
+		fake_bus_clear_transactions();
+		float m[3] = {1, 2, 3};
+		CHECK(!ak_mag_read(m));
+		CHECK(bus.transaction_count == 0);
+		CHECK(m[0] == 1 && m[1] == 2 && m[2] == 3);
+	}
+	return 0;
+}
+
+static int test_modes_ak_conversion_deadline(void)
+{
+	reset_driver(&odr_cases[0]);
+	bus.precise_clock = true;
+	bus.now_us = 890;
+	float actual;
+	CHECK(ak_update_odr(INFINITY, &actual) == 0);
+	ak_mag_oneshot();
+	int64_t trigger_us = bus.now_us;
+	CHECK(trigger_us == 990);
+	/* 50 us polls see incomplete at 4040 us, then ready at 4090 us. */
+	bus.transaction_us = 50;
+	bus.ready_at_us = trigger_us + 3100;
+	bus.ready_reg = AK09940_ST1;
+	bus.ready_mask = AK09940_ST1_DRDY;
+	bus.registers[AK09940_HXL] = 10;
+	float m[3] = {1, 2, 3};
+	CHECK(ak_mag_read(m));
+	CHECK(bus.now_us == trigger_us + 3100);
+	CHECK(fabsf(m[0] - 0.001f) < 0.000001f && m[1] == 0 && m[2] == 0);
+	bus.ready_at_us = 0;
+	bus.registers[AK09940_ST1] = 0;
+	ak_mag_oneshot();
+	m[0] = 1; m[1] = 2; m[2] = 3;
+	CHECK(!ak_mag_read(m));
+	CHECK(m[0] == 1 && m[1] == 2 && m[2] == 3);
+	ak_mag_oneshot();
+	fake_bus_clear_transactions();
+	bus.fail_transaction = 1;
+	CHECK(!ak_mag_read(m));
+	CHECK(bus.transaction_count == 1);
+	CHECK(m[0] == 1 && m[1] == 2 && m[2] == 3);
+	return 0;
+}
+
+static int test_modes_ak_fractional_rates(void)
+{
+	static const struct {
+		float hz;
+		float actual;
+		uint8_t mode;
+	} cases[] = {
+		{0.5f, 0.1f, MODE_CMM1_10Hz},
+		{10, 0.1f, MODE_CMM1_10Hz},
+		{10.5f, 0.05f, MODE_CMM2_20Hz},
+		{20, 0.05f, MODE_CMM2_20Hz},
+		{20.5f, 0.02f, MODE_CMM3_50Hz},
+		{50, 0.02f, MODE_CMM3_50Hz},
+		{50.5f, 0.01f, MODE_CMM4_100Hz},
+		{100, 0.01f, MODE_CMM4_100Hz},
+		{100.5f, 0.005f, MODE_CMM5_200Hz},
+	};
+	for (size_t i = 0; i < ARRAY_SIZE(cases); i++) {
+		reset_driver(&odr_cases[0]);
+		float actual = -1;
+		CHECK(ak_update_odr(1.0f / cases[i].hz, &actual) == 0);
+		CHECK(float_equal(actual, cases[i].actual));
+		CHECK(bus.op_count == 2);
+		CHECK(bus.ops[1].value == ((MT_LND2 << 5) | cases[i].mode));
+	}
+	float actual = -1;
+	CHECK(ak_update_odr(0, &actual) == 0 && actual == 0);
+	CHECK(ak_update_odr(INFINITY, &actual) == 0 && actual == 0);
+	CHECK(bus.registers[AK09940_CNTL3] == ((MT_LND2 << 5) | MODE_PDM));
+	return 0;
+}
+
+static int test_modes_bmm350_normal_forced(void)
+{
+	fake_bus_reset();
+	bus.registers[BMM350_CHIP_ID_REG] = BMM350_CHIP_ID;
+	float actual;
+	CHECK(bmm3_init(1.0f, &actual) == 0);
+	CHECK(bus.registers[BMM350_PMU_CMD_AGGR_SET] == ((AGGR_AVG_8 << 4) | AGGR_ODR_1_5625Hz));
+	CHECK(bmm3_update_odr(0, &actual) == 0);
+	bus.precise_clock = true;
+	bus.now_us = 200000;
+	fake_bus_clear_transactions();
+	bmm3_mag_oneshot();
+	CHECK(bus.ops[0].reg == BMM350_PMU_CMD && bus.ops[0].value == 0x03);
+	bus.ready_at_us = bus.now_us + 30000;
+	bus.ready_reg = BMM350_INT_STATUS;
+	bus.ready_mask = BMM350_DRDY_DATA_REG;
+	float m[3] = {1, 2, 3};
+	CHECK(bmm3_mag_read(m));
+	CHECK(bus.now_us == 230000);
+	CHECK(m[0] == 0 && m[1] == 0 && m[2] == 0);
+	CHECK(bmm3_update_odr(INFINITY, &actual) == 0);
+	static const int64_t gaps_us[] = {10000, 200000};
+	for (size_t i = 0; i < ARRAY_SIZE(gaps_us); i++) {
+		bus.now_us += gaps_us[i];
+		bus.registers[BMM350_INT_STATUS] = 0;
+		bus.ready_at_us = 0;
+		fake_bus_clear_transactions();
+		bmm3_mag_oneshot();
+		CHECK(bus.op_count == 1 && bus.ops[0].value == 0x03);
+		int64_t trigger_us = bus.now_us;
+		bus.ready_at_us = trigger_us + 3100;
+		bus.registers[BMM350_MAG_X_XLSB] = (uint8_t)(10 * (i + 1));
+		CHECK(bmm3_mag_read(m));
+		CHECK(bus.now_us - trigger_us == 3100);
+		static const float expected_x[] = {0.0007069979f, 0.0014139958f};
+		CHECK(fabsf(m[0] - expected_x[i]) < 0.00000001f && m[1] == 0 && m[2] == 0);
+	}
+	fake_bus_clear_transactions();
+	bus.fail_transaction = 1;
+	bmm3_mag_oneshot();
+	fake_bus_clear_transactions();
+	m[0] = 1; m[1] = 2; m[2] = 3;
+	CHECK(!bmm3_mag_read(m));
+	CHECK(bus.op_count == 0 && m[0] == 1 && m[1] == 2 && m[2] == 3);
+	bus.ready_at_us = 0;
+	bus.registers[BMM350_INT_STATUS] = 0;
+	bmm3_mag_oneshot();
+	fake_bus_clear_transactions();
+	int64_t timeout_start_us = bus.now_us;
+	CHECK(!bmm3_mag_read(m));
+	CHECK(bus.now_us - timeout_start_us >= 39000);
+	CHECK(m[0] == 1 && m[1] == 2 && m[2] == 3);
+	return 0;
+}
+
+static int test_modes_mmc_completion_wins(void)
+{
+	static const struct {
+		size_t driver;
+		void (*trigger)(void);
+		bool (*read)(float *);
+		uint8_t status;
+		uint8_t done;
+		int deadline_ms;
+		uint32_t length;
+		float zero_raw;
+	} cases[] = {
+		{7, mmc5603_mag_oneshot, mmc5603_mag_read, MMC5603NJ_STATUS, 0x40, 4, 9, -32},
+		{8, mmc_mag_oneshot, mmc_mag_read, MMC5983MA_STATUS, 0x01, 2, 7, -8},
+	};
+	for (size_t i = 0; i < ARRAY_SIZE(cases); i++) {
+		for (int scenario = 0; scenario < 7; scenario++) {
+			reset_driver(&odr_cases[cases[i].driver]);
+			float actual;
+			CHECK(odr_cases[cases[i].driver].update_odr(INFINITY, &actual) == 0);
+			bus.precise_clock = true;
+			if (scenario == 6) {
+				fake_bus_clear_transactions();
+				bus.fail_transaction = 1;
+			}
+			cases[i].trigger();
+			fake_bus_clear_transactions();
+			float m[3] = {1, 2, 3};
+			bus.now_us = (cases[i].deadline_ms + 1) * 1000;
+			bus.registers[cases[i].status] = cases[i].done;
+			if (scenario == 1)
+				bus.registers[cases[i].status] = 0;
+			if (scenario == 2) {
+				bus.now_us = 0;
+				bus.transaction_us = 100;
+				bus.registers[cases[i].status] = 0;
+				bus.ready_reg = cases[i].status;
+				bus.ready_mask = cases[i].done;
+				bus.ready_at_us = cases[i].deadline_ms * 1000;
+			}
+			if (scenario == 3)
+				bus.fail_transaction = 1;
+			if (scenario == 4)
+				bus.fail_transaction = 2;
+			if (scenario == 5)
+				bus.now_us = cases[i].deadline_ms * 1000;
+			bool success = scenario == 0 || scenario == 2 || scenario == 5;
+			CHECK(cases[i].read(m) == success);
+			if (success) {
+				CHECK(m[0] == cases[i].zero_raw && m[1] == cases[i].zero_raw && m[2] == cases[i].zero_raw);
+				CHECK(count_ops(FAKE_BURST_READ) == 1);
+				CHECK(bus.ops[bus.op_count - 1].length == cases[i].length);
+				if (scenario != 2)
+					CHECK(bus.transaction_count == 2);
+				else
+					CHECK(bus.wait_count > 0 && bus.waits_us[bus.wait_count - 1] == 100);
+			} else {
+				CHECK(m[0] == 1 && m[1] == 2 && m[2] == 3);
+				CHECK(count_ops(FAKE_BURST_READ) == (scenario == 4 ? 1U : 0U));
+			}
+		}
+	}
+	return 0;
+}
+
+static int test_rates_fractional_selection(void)
+{
+	const struct {
+		const sensor_mag_t *driver;
+		float requested_hz;
+		float actual_hz;
+		uint8_t reg;
+		uint8_t value;
+	} cases[] = {
+		{&sensor_mag_bmm150, 10.5f, 15, BMM150_OP_CTRL, 0x20},
+		{&sensor_mag_bmm150, 0.5f, 2, BMM150_OP_CTRL, 0x08},
+		{&sensor_mag_ist8306, 10.5f, 20, IST8306_CNTL2, MODE_CMM_20Hz},
+		{&sensor_mag_ist8306, 0.5f, 10, IST8306_CNTL2, MODE_CMM_10Hz},
+		{&sensor_mag_ist8308, 10.5f, 20, IST8306_CNTL2, MODE_CMM_20Hz},
+		{&sensor_mag_ist8308, 0.5f, 10, IST8306_CNTL2, MODE_CMM_10Hz},
+		{&sensor_mag_lis3mdl, 0.7f, 1.25f, LIS3MDL_CTRL_REG1, 0xe4},
+		{&sensor_mag_lis3mdl, 1.3f, 2.5f, LIS3MDL_CTRL_REG1, 0xe8},
+		{&sensor_mag_lis3mdl, 2.6f, 5, LIS3MDL_CTRL_REG1, 0xec},
+		{&sensor_mag_qmc5883l, 10.5f, 50, 0x09, 0x15},
+		{&sensor_mag_qmc6309, 1.5f, 10, 0x0b, 0x18},
+	};
+	qmc_set_variant(false);
+	for (size_t i = 0; i < ARRAY_SIZE(cases); i++) {
+		fake_bus_reset();
+		cases[i].driver->shutdown();
+		fake_bus_reset();
+		float actual = -1;
+		CHECK(cases[i].driver->update_odr(1.0f / cases[i].requested_hz, &actual) == 0);
+		CHECK(float_equal(actual, 1.0f / cases[i].actual_hz));
+		CHECK(bus.registers[cases[i].reg] == cases[i].value);
+	}
+	return 0;
+}
+
+static int test_rates_qmc_ceiling(void)
+{
+	const float requests[] = {1, 10, 10.5f, 20, 25, 50, 50.5f, 100, 100.5f, 500};
+	const float non_h[] = {1, 10, 50, 50, 50, 50, 100, 100, 200, 200};
+	const uint8_t codes[] = {0x08, 0x18, 0x28, 0x28, 0x28, 0x28, 0x38, 0x38, 0x48, 0x48};
+	for (int h = 0; h < 2; h++) {
+		for (size_t i = 0; i < ARRAY_SIZE(requests); i++) {
+			fake_bus_reset();
+			qmc_set_variant(h != 0);
+			float actual = -1;
+			CHECK(qmc_update_odr(1.0f / requests[i], &actual) == 0);
+			CHECK(float_equal(actual, 1.0f / (h && non_h[i] < 50 ? 50 : non_h[i])));
+			CHECK(bus.registers[0x0b] == (h && i < 2 ? 0x28 : codes[i]));
+		}
+	}
+	return 0;
+}
+
+static int test_rates_qmc_fresh_identical_samples(void)
+{
+	const sensor_mag_t *drivers[] = {&sensor_mag_qmc5883l, &sensor_mag_qmc6309};
+	const uint8_t status_regs[] = {0x06, 0x09};
+	const uint8_t data_regs[] = {0x00, 0x01};
+	for (size_t i = 0; i < ARRAY_SIZE(drivers); i++) {
+		fake_bus_reset();
+		float actual;
+		CHECK(drivers[i]->init(0.02f, &actual) == 0);
+		bus.registers[status_regs[i]] = 1;
+		bus.registers[data_regs[i]] = 12;
+		float m[3] = {0};
+		bus.now_ms = 100;
+		CHECK(drivers[i]->mag_read(m));
+		bus.now_ms = 101;
+		CHECK(drivers[i]->mag_read(m));
+		for (int shot = 0; shot < 2; shot++) {
+			drivers[i]->mag_oneshot();
+			CHECK(drivers[i]->mag_read(m));
+		}
+		CHECK(drivers[i]->init(0.02f, &actual) == 0);
+		fake_spec = SENSOR_INTERFACE_SPEC_EXT;
+		bus.now_ms = 200;
+		CHECK(drivers[i]->mag_read(m));
+		bus.now_ms = 201;
+		CHECK(!drivers[i]->mag_read(m));
+		bus.now_ms = 223;
+		CHECK(drivers[i]->mag_read(m));
+	}
+	return 0;
+}
+
+static int test_rates_qmc_ready_after_deadline(void)
+{
+	const sensor_mag_t *drivers[] = {&sensor_mag_qmc5883l, &sensor_mag_qmc6309};
+	const uint8_t status_regs[] = {0x06, 0x09};
+	for (size_t i = 0; i < ARRAY_SIZE(drivers); i++) {
+		fake_bus_reset();
+		float actual;
+		CHECK(drivers[i]->init(INFINITY, &actual) == 0);
+		drivers[i]->mag_oneshot();
+		bus.now_ms += 20;
+		bus.registers[status_regs[i]] = 1;
+		float m[3] = {123, 456, 789};
+		CHECK(drivers[i]->mag_read(m));
+		CHECK(m[0] == 0 && m[1] == 0 && m[2] == 0);
+	}
+	return 0;
+}
+
+static int test_rates_qmc5883_shot_standby(void)
+{
+	for (int outcome = 0; outcome < 6; outcome++) {
+		fake_bus_reset();
+		float actual;
+		CHECK(qmc5883l_init(INFINITY, &actual) == 0);
+		qmc5883l_mag_oneshot();
+		fake_bus_clear_transactions();
+		bus.registers[0x06] = outcome == 1 ? 0 : outcome == 2 ? 3 : 1;
+		bus.registers[0] = 12;
+		if (outcome == 3) bus.fail_transaction = 1;
+		if (outcome == 4) bus.fail_transaction = 2;
+		if (outcome == 5) bus.fail_transaction = 3;
+		float m[3] = {123, 456, 789};
+		CHECK(qmc5883l_mag_read(m) == (outcome == 0));
+		CHECK(bus.ops[bus.op_count - 1].type == FAKE_REG_WRITE);
+		CHECK(bus.ops[bus.op_count - 1].reg == 0x09);
+		CHECK(bus.ops[bus.op_count - 1].value == 0);
+		if (outcome != 0) {
+			CHECK(m[0] == 123 && m[1] == 456 && m[2] == 789);
+		} else {
+			CHECK(float_equal(m[0], 0.004f));
+			CHECK(m[1] == 0 && m[2] == 0);
+		}
+		fake_bus_clear_transactions();
+		bus.registers[0x06] = 1;
+		qmc5883l_mag_oneshot();
+		CHECK(qmc5883l_mag_read(m));
+		CHECK(bus.registers[0x09] == 0);
+		fake_bus_clear_transactions();
+		CHECK(qmc5883l_update_odr(0.02f, &actual) == 0);
+		CHECK(bus.op_count == 1 && bus.registers[0x09] == 0x15);
+	}
+	return 0;
+}
+
+static int test_rates_bmm150_rhall_polynomial(void)
+{
+	fake_bus_reset();
+	bus.registers[BMM150_DIG_X1] = (uint8_t)-3;
+	bus.registers[BMM150_DIG_X1 + 1] = 5;
+	bus.registers[BMM150_DIG_Z4_LSB + 2] = 7;
+	bus.registers[BMM150_DIG_Z4_LSB + 3] = (uint8_t)-9;
+	bus.registers[BMM150_DIG_Z2_LSB + 1] = 0x20;
+	bus.registers[BMM150_DIG_Z2_LSB + 3] = 0x40;
+	bus.registers[BMM150_DIG_Z2_LSB + 5] = 0x20;
+	bus.registers[BMM150_DIG_Z2_LSB + 8] = (uint8_t)-8;
+	bus.registers[BMM150_DIG_Z2_LSB + 9] = 32;
+	float actual;
+	CHECK(bmm1_init(0.04f, &actual) == 0);
+	const uint16_t rhall[] = {4096, 8192, 12288, 0};
+	const float expected[][2] = {
+		{0.34175048828125f, -0.6201416015625f},
+		{0.311171875f, -0.56484375f},
+		{0.29644883897569446f, -0.5382188585069444f},
+		{0, 0},
+	};
+	for (size_t i = 0; i < ARRAY_SIZE(rhall); i++) {
+		for (int invalid = -1; invalid < 2; invalid++) {
+			int16_t axes[] = {100, -200, 300};
+			if (invalid >= 0) axes[invalid] = -4096;
+			bmm150_frame(axes);
+			bus.registers[BMM150_RHALL_LSB] = (uint8_t)(rhall[i] << 2);
+			bus.registers[BMM150_RHALL_LSB + 1] = (uint8_t)(rhall[i] >> 6);
+			float m[3];
+			bmm1_mag_process(&bus.registers[BMM150_DATAX_LSB], m);
+			CHECK(fabsf(m[0] - (invalid == 0 ? 0 : expected[i][0])) < 0.000001f);
+			CHECK(fabsf(m[1] - (invalid == 1 ? 0 : expected[i][1])) < 0.000001f);
+		}
+	}
+	bus.registers[BMM150_DIG_Z2_LSB + 5] = 0;
+	CHECK(bmm1_init(0.04f, &actual) == 0);
+	const int16_t axes[] = {100, -200, 300};
+	bmm150_frame(axes);
+	float m[3];
+	bmm1_mag_process(&bus.registers[BMM150_DATAX_LSB], m);
+	CHECK(m[0] == 0 && m[1] == 0 && m[2] == 0);
+	return 0;
+}
+
+static int test_rates_ist_models_remain_independent(void)
+{
+	fake_bus_reset();
+	float actual;
+	CHECK(sensor_mag_ist8306.init(0.02f, &actual) == 0);
+	CHECK(sensor_mag_ist8308.init(0.1f, &actual) == 0);
+	fake_bus_clear_transactions();
+	CHECK(sensor_mag_ist8306.update_odr(0.02f, &actual) == 0);
+	CHECK(float_equal(actual, 0.02f));
+	CHECK(bus.op_count == 0);
+	uint8_t raw[] = {100, 0, 0x38, 0xff, 0x2c, 1};
+	float m[3];
+	sensor_mag_ist8306.mag_process(raw, m);
+	CHECK(float_equal(m[0], 0.3f) && float_equal(m[1], -0.6f) && float_equal(m[2], 0.9f));
+	sensor_mag_ist8308.mag_process(raw, m);
+	CHECK(float_equal(m[0], 0.075f) && float_equal(m[1], -0.15f) && float_equal(m[2], 0.225f));
+	sensor_mag_ist8306.mag_oneshot();
+	fake_bus_clear_transactions();
+	CHECK(sensor_mag_ist8308.update_odr(0.1f, &actual) == 0);
+	CHECK(bus.op_count == 0);
+	fake_bus_clear_transactions();
+	bus.fail_transaction = 1;
+	actual = -123;
+	CHECK(sensor_mag_ist8308.init(0.02f, &actual) == -EIO);
+	CHECK(bus.op_count == 1 && actual == -123);
+	return 0;
+}
+
+struct test_case {
+	const char *name;
+	int (*run)(void);
+};
+
+static int run_isolated(const struct test_case *test)
+{
+	pid_t child = fork();
+	if (child < 0) {
+		perror("fork");
+		return 1;
+	}
+	if (child == 0) {
+		alarm(2);
+		int result = test->run();
+		fflush(NULL);
+		_exit(result == 0 ? EXIT_SUCCESS : EXIT_FAILURE);
+	}
+
+	int status;
+	if (waitpid(child, &status, 0) < 0) {
+		perror("waitpid");
+		return 1;
+	}
+	if (WIFEXITED(status) && WEXITSTATUS(status) == EXIT_SUCCESS) {
+		printf("PASS %s\n", test->name);
+		return 0;
+	}
+	if (WIFSIGNALED(status))
+		fprintf(stderr, "FAIL %s (signal %d)\n", test->name, WTERMSIG(status));
+	else
+		fprintf(stderr, "FAIL %s\n", test->name);
+	return 1;
+}
+
+int main(void)
+{
+#if defined(TEST_IST8306_ONLY) || defined(TEST_IST8308_ONLY)
+#if defined(TEST_IST8306_ONLY)
+	const sensor_mag_t *driver = &sensor_mag_ist8306;
+	const float scale = 0.3f;
+#else
+	const sensor_mag_t *driver = &sensor_mag_ist8308;
+	const float scale = 0.075f;
+#endif
+	fake_bus_reset();
+	float actual;
+	CHECK(driver->init(1.0f / 10.5f, &actual) == 0);
+	CHECK(float_equal(actual, 0.05f));
+	bus.registers[IST8306_STAT] = 1;
+	bus.registers[IST8306_DATAXL] = 100;
+	float m[3] = {123, 456, 789};
+	CHECK(driver->mag_read(m));
+	CHECK(float_equal(m[0], scale) && m[1] == 0 && m[2] == 0);
+	driver->mag_oneshot();
+	bus.now_ms += 10;
+	CHECK(driver->mag_read(m));
+	CHECK(float_equal(m[0], scale));
+	return EXIT_SUCCESS;
+#else
+	static const struct test_case tests[] = {
+		{"BMM350 init and compensation", test_bmm350_init_and_compensation},
+		{"Modes AK powerdown transitions", test_modes_ak_powerdown_transitions},
+		{"Modes AK conversion deadline", test_modes_ak_conversion_deadline},
+		{"Modes AK fractional rates", test_modes_ak_fractional_rates},
+		{"Modes BMM350 normal forced", test_modes_bmm350_normal_forced},
+		{"Modes MMC completion wins", test_modes_mmc_completion_wins},
+		{"11-driver fixed-ODR transaction matrix", test_all_fixed_odr_transactions},
+		{"Fractional magnetometer rates", test_rates_fractional_selection},
+		{"QMC6309 variant rate ceiling", test_rates_qmc_ceiling},
+		{"QMC confirmed identical samples", test_rates_qmc_fresh_identical_samples},
+		{"QMC ready poll wins deadline", test_rates_qmc_ready_after_deadline},
+		{"QMC5883 shot terminal standby", test_rates_qmc5883_shot_standby},
+		{"BMM150 shared RHALL polynomial", test_rates_bmm150_rhall_polynomial},
+		{"IST8308 init drive-rate write", test_ist8308_init_programs_drive_rate_first},
+		{"IST independent model state and scaling", test_rates_ist_models_remain_independent},
+		{"LIS3 oneshot timeout", test_lis3_oneshot_timeout_stops_before_data},
+		{"LIS temperatures", test_lis_temperatures_fail_loudly_and_apply_offset},
+		{"AK09940 frame validity", test_ak09940_rejects_invalid_frames},
+		{"LIS3 combined status/data", test_lis3_combines_status_and_data},
+		{"Combined status/data drivers", test_status_plus_data_drivers_publish_only_ready},
+		{"Free-running status/data frames", test_free_running_status_frames_ignore_consumed_ready},
+		{"BMM350 free-running XYZ frames", test_bmm350_free_running_reads_xyz_frames},
+		{"MMC continuous repeat rejection", test_mmc_continuous_frames_drop_repeats},
+		{"MMC5603 integer ODR and bandwidth", test_mmc5603_integer_odr_and_bandwidth},
+		{"BMM150 direct status", test_bmm150_direct_status_gate},
+		{"Status-less hub frames do not wait", test_status_less_hub_frames_do_not_wait},
+		{"BMM150 axis overflow", test_bmm150_overflow_is_not_published},
+		{"MMC oneshot timeouts", test_mmc_timeouts_stop_before_data},
+		{"MMC temperature read failures", test_mmc_temperature_failures_do_not_publish_bias},
+		{"QMC oneshot timeouts", test_qmc_timeouts_stop_before_data},
+		{"QMC direct status and variant ODR", test_qmc_direct_status_gate_and_variant_odr},
+		{"QMC trigger and burst failures", test_qmc_trigger_and_burst_failures_are_not_published},
+		{"QMC oneshot overflow", test_qmc_oneshot_overflow_is_not_published},
+		{"QMC unaligned decode", test_qmc_raw_decode_allows_unaligned_input},
+		{"MMC5603 calibration control restore", test_mmc5603_calibration_restores_control},
+		{"MMC5983 calibration control restore", test_mmc5983_calibration_restores_control},
+	};
+
+	int failed = 0;
+	for (size_t i = 0; i < ARRAY_SIZE(tests); i++)
+		failed += run_isolated(&tests[i]);
+	if (failed) {
+		fprintf(stderr, "%d sensor driver tests failed\n", failed);
+		return EXIT_FAILURE;
+	}
+	printf("All %zu sensor driver tests passed\n", ARRAY_SIZE(tests));
+	return EXIT_SUCCESS;
+#endif
+}

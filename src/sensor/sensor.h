@@ -1,0 +1,240 @@
+/*
+	SlimeVR Code is placed under the MIT license
+	Copyright (c) 2025 SlimeVR Contributors
+
+	Permission is hereby granted, free of charge, to any person obtaining a copy
+	of this software and associated documentation files (the "Software"), to deal
+	in the Software without restriction, including without limitation the rights
+	to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+	copies of the Software, and to permit persons to whom the Software is
+	furnished to do so, subject to the following conditions:
+
+	The above copyright notice and this permission notice shall be included in
+	all copies or substantial portions of the Software.
+
+	THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+	IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+	FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+	AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+	LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+	OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+	THE SOFTWARE.
+*/
+#ifndef SLIMENRF_SENSOR
+#define SLIMENRF_SENSOR
+
+#include "interface.h"
+
+const char *sensor_get_sensor_imu_name(void);
+const char *sensor_get_sensor_mag_name(void);
+const char *sensor_get_sensor_fusion_name(void);
+bool sensor_is_initialized(void);
+/* True only after a valid current fusion frame, not merely driver discovery. */
+bool sensor_output_ready(void);
+/* Driver acquisition owner: report an explicitly lost/unknown gyro interval
+ * (overrun or destructive FIFO flush), not empty/other-channel/invalid markers.
+ * Active raw calibration consumers must reject the interrupted stream. */
+void sensor_gyro_report_discontinuity(void);
+
+/* Suspended sensors may be queried when already initialized, but not rescanned. */
+int sensor_request_scan(bool force, bool user_feedback);
+
+void sensor_retained_write(void);
+void sensor_record_wom_sleep(void);
+
+/* Caller owns a successful main_imu_suspend() lease, transferred to power
+ * even on failure. A negative return is a lifecycle or IMU shutdown error.
+ * When non-NULL, access_quiesced is true only if host-side sensor access
+ * is stopped; it does not attest to successful IMU reset or sleep. */
+int sensor_shutdown(bool *access_quiesced);
+/* Return GPIO pull/sense configuration, or a negative lifecycle error. */
+int sensor_setup_WOM(void);
+
+#if CONFIG_SENSOR_USE_MAGNETOMETER
+int sensor_set_mag_enabled(bool enabled);
+#endif
+bool sensor_get_mag_enabled(void);
+bool sensor_get_mag_available(void);
+bool sensor_get_mag_calibrated(void);
+void sensor_refresh_sensor_ids(void);
+#if CONFIG_SENSOR_USE_MAGNETOMETER
+void sensor_mag_ref_reset(void);
+#endif
+
+/* Fusion policy accessors (backend-agnostic; prefer over vqf_* / eqf_*). */
+#if CONFIG_SENSOR_USE_MAGNETOMETER
+bool sensor_fusion_get_mag_dist_detected(void);
+/* Thread-safe requests, applied only by sensor before the next magnetic feed. */
+void sensor_fusion_reset_mag_ref(void);
+void sensor_fusion_set_mag_ref(float norm, float dip);
+bool sensor_fusion_get_mag_ref(float *norm, float *dip);
+#endif
+
+/* Nonblocking requests consumed by the sensor at the next frame boundary. */
+int sensor_request_fusion_reset(bool user_feedback);
+
+void wait_for_threads(void);
+/* Failure means the caller must not reconfigure hardware or stop clocks.
+ * A successful suspension is owned by the caller until resume; shutdown
+ * transfers the still-suspended subsystem to the power thread. */
+int main_imu_suspend(void);
+bool main_imu_is_suspended(void);
+void main_imu_resume(void);
+int main_imu_restart(void);
+
+#if CONFIG_SENSOR_USE_TCAL
+float sensor_get_current_imu_temperature(void);
+#endif
+
+#if CONFIG_SENSOR_TCAL_HEATED
+struct sensor_temperature_observation {
+	float raw_c;
+	float filtered_c;
+	int64_t sampled_at_ms;
+	uint32_t sequence;
+};
+/* Snapshot only: does not refresh the sample timestamp or heater lease. */
+int sensor_get_imu_temperature_observation(
+	struct sensor_temperature_observation *out, int64_t max_age_ms);
+#endif
+
+// Get actual sensor ODR (Output Data Rate) in Hz
+float sensor_get_accel_odr(void);
+float sensor_get_gyro_odr(void);
+float sensor_get_mag_odr(void);     /* driver-reported Hz; 0.0f => n/a */
+float sensor_get_mag_feed_hz(void); /* measured fusion feed Hz; 0.0f => n/a */
+float sensor_get_fusion_rate(void); /* effective gyro feed into fusion */
+
+/* Batch raw collection: fractional-rate emission, 0 = accelerometer ODR. */
+#if CONFIG_CONNECTION_RAW_COLLECTION
+void sensor_set_batch_collect(bool active, float emit_hz);
+#endif
+float sensor_get_processing_work_time_ms(void); /* processing-work EMA, not full loop period */
+
+#include "diagnostics.h"
+
+typedef struct sensor_fusion {
+	void (*init)(float, float, float); // gyro_time, accel_time, mag_time
+	/* Load with the current effective sensor periods, even on first boot. */
+	void (*load)(const void *, float, float, float);
+	void (*save)(void *);
+
+	void (*update_gyro)(float *, float);  // deg/s
+	void (*update_accel)(float *, float); // g
+#if CONFIG_SENSOR_USE_MAGNETOMETER
+	void (*update_mag)(float *, float);   // any unit (usually gauss)
+#endif
+	void (*update)(float *, float *, float *, float);
+
+	void (*get_gyro_bias)(float *);
+	void (*set_gyro_bias)(float *);
+	/* Input coordinate change (new input = old + delta), not a measurement. */
+	void (*rebase_gyro_bias)(const float delta_dps[3]);
+
+	void (*get_lin_a)(float *);
+	void (*get_quat)(float *);
+	/* NULL when no magnetically independent inclination estimate is available. */
+	void (*get_quat6)(float *);
+
+	/* Rest / mag-quality policy (both VQF and EqF implement these). */
+	bool (*get_rest_detected)(void);
+	/* Consume one new detector observation; NULL discards it. Call only from
+	 * the sensor owner, or an exclusive lifecycle owner after the sensor
+	 * thread is confirmed stopped/suspended (not merely requested to stop). */
+	bool (*take_rest_observation)(bool *out);
+#if CONFIG_SENSOR_USE_MAGNETOMETER
+	bool (*get_mag_dist_detected)(void);
+	/* Sensor-thread only: replace magnetic domain, preserving attitude/bias. */
+	void (*rebase_mag)(float norm, float dip);
+	void (*get_mag_ref)(float *norm, float *dip);
+#endif
+} sensor_fusion_t;
+
+/* How the MCU reaches an auxiliary sensor through the selected IMU.
+ * External-sensor FIFO delivery is a separate, currently unsupported contract. */
+enum sensor_ext_mode {
+	SENSOR_EXT_MODE_OFF,
+	SENSOR_EXT_MODE_I2C_PASSTHROUGH,
+	SENSOR_EXT_MODE_I2CM_PROXY,
+};
+
+typedef struct sensor_imu {
+	/* Periods are in seconds; a positive clock rate requests external CLKIN
+	 * where supported. Return 0 on success, negative on failure. */
+	int (*init)(
+		float clock_rate_hz,
+		float accel_period_s,
+		float gyro_period_s,
+		float *actual_accel_period_s,
+		float *actual_gyro_period_s
+	);
+	/* Return 0 for a successful shutdown command, or a negative errno. */
+	int (*shutdown)(void);
+
+	/* Requested and actual full-scale ranges: g for accel, deg/s for gyro. */
+	void (*update_fs)(
+		float accel_range_g,
+		float gyro_range_dps,
+		float *actual_accel_range_g,
+		float *actual_gyro_range_dps
+	);
+	/* Return 0 on success, including an unchanged configuration; negative on
+	 * failure. Off/standby support for <= 0 and INFINITY is driver-specific.
+	 * Actual-period outputs are not guaranteed on failure. */
+	int (*update_odr)(
+		float accel_period_s,
+		float gyro_period_s,
+		float *actual_accel_period_s,
+		float *actual_gyro_period_s
+	);
+
+	/* Buffer capacity is in bytes; return the number of complete driver
+	 * records available to fifo_process (possibly a prefix on I/O failure). */
+	uint16_t (*fifo_read)(uint8_t *data, uint16_t capacity_bytes);
+	/* Index selects a driver record, not a byte offset. Return 0 to consume,
+	 * nonzero to skip. Initialize both vectors before calling: a record may
+	 * update only one channel; invalid-channel handling is driver-specific. */
+	int (*fifo_process)(uint16_t packet_index, uint8_t *data, float accel_g[3], float gyro_dps[3]);
+	void (*accel_read)(float accel_g[3]);
+	void (*gyro_read)(float gyro_dps[3]);
+	float (*temp_read)(void); // deg C; failure sentinel is driver-specific
+
+	/* Return packed nRF GPIO pull (high nibble) and sense (low nibble)
+	 * settings. Zero means unavailable; some drivers only log I/O failures
+	 * and still return pin settings. Watermark encoding is chip-specific. */
+	uint8_t (*setup_DRDY)(uint16_t threshold);
+	uint8_t (*setup_WOM)(void);
+
+	int (*ext_setup)(enum sensor_ext_mode mode); // select auxiliary route; 0 on success, negative on error/unsupported
+} sensor_imu_t;
+
+typedef struct sensor_mag {
+	/* Periods are in seconds. Return 0 on success, negative on failure;
+	 * actual-period output is not guaranteed on failure. */
+	int (*init)(float period_s, float *actual_period_s);
+	void (*shutdown)(void);
+
+	/* Return 0 on success, including an unchanged configuration; negative on
+	 * failure. <= 0 and INFINITY may select idle, oneshot or a supported
+	 * continuous rate, depending on the chip. Check the actual period. */
+	int (*update_odr)(float period_s, float *actual_period_s);
+
+	void (*mag_oneshot)(void); // trigger a single measurement where supported
+	/* True means the output was updated; freshness checks are driver-specific.
+	 * Vector units are driver-specific (usually gauss). */
+	bool (*mag_read)(float mag[3]);
+	/* Return deg C. Drivers with SET/RESET offset measurement may update bias
+	 * in the same units as mag_read; other drivers leave it untouched. */
+	float (*temp_read)(float bias[3]);
+
+	/* Decode the chip-specific raw magnetic payload, without initiating a
+	 * bus read. Frame/status validation belongs to the acquisition path. */
+	void (*mag_process)(uint8_t *raw_mag, float mag[3]);
+	uint8_t ext_min_burst; // minimum external-interface read transaction length
+	uint8_t ext_burst;     // preferred full burst length
+	/* Opt in to consuming an available cached frame before its ODR deadline.
+	 * mag_read must still enforce the driver's freshness admission policy. */
+	bool cached_poll_safe;
+} sensor_mag_t;
+
+#endif

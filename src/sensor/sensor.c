@@ -1,0 +1,4021 @@
+/*
+	SlimeVR Code is placed under the MIT license
+	Copyright (c) 2025 SlimeVR Contributors
+
+	Permission is hereby granted, free of charge, to any person obtaining a copy
+	of this software and associated documentation files (the "Software"), to deal
+	in the Software without restriction, including without limitation the rights
+	to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+	copies of the Software, and to permit persons to whom the Software is
+	furnished to do so, subject to the following conditions:
+
+	The above copyright notice and this permission notice shall be included in
+	all copies or substantial portions of the Software.
+
+	THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+	IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+	FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+	AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+	LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+	OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+	THE SOFTWARE.
+*/
+#include "globals.h"
+#include "system/system.h"
+#include "system/power.h"
+#include "system/test_mode.h"
+#include "system/wom_timeout.h"
+#include "system/esb_ota.h"
+#include "system/watchdog.h"
+#include "util.h"
+#include "connection/connection.h"
+#include "connection/tracker_events.h"
+#include "calibration/calibration.h"
+#include "calibration/imu_calibration.h"
+#include "calibration/cal_sample.h"
+#if CONFIG_SENSOR_USE_MAGNETOMETER
+#include "calibration/mag_common.h"
+#include "calibration/online_mag.h"
+#endif
+#if CONFIG_SENSOR_USE_TCAL
+#include "calibration/tcal_mls_lut.h"
+#endif
+#if CONFIG_SENSOR_TCAL_HEATED
+#include "calibration/tcal_heated.h"
+#endif
+#include "motion_state.h"
+#include "zephyr/logging/log.h"
+#include <errno.h>
+#include <zephyr/sys/reboot.h>
+
+#include <math.h>
+#include <hal/nrf_gpio.h>
+#include <hal/nrf_power.h>
+#include <zephyr/sys/atomic.h>
+
+#if CONFIG_CMSIS_DSP
+#include <arm_math.h>
+#endif
+
+#include "fusion/fusions.h"
+#include "sensors.h"
+
+#include "sensor.h"
+
+#if CONFIG_CONNECTION_RAW_COLLECTION
+#include "raw_collection.h"
+#endif
+#define SPI_OP SPI_MODE_CPOL | SPI_MODE_CPHA | SPI_WORD_SET(8)
+
+
+#ifndef SENSOR_REST_ENTER_STABLE_MS
+#define SENSOR_REST_ENTER_STABLE_MS 1000
+#endif
+#ifndef SENSOR_REST_EXIT_MOTION_MS
+#define SENSOR_REST_EXIT_MOTION_MS 250
+#endif
+
+#define SENSOR_ACTIVITY_STARTUP_GUARD_MS 5000
+
+
+#if DT_NODE_HAS_STATUS(DT_NODELABEL(imu_spi), okay)
+#define SENSOR_IMU_SPI_EXISTS true
+#define SENSOR_IMU_SPI_NODE DT_NODELABEL(imu_spi)
+static struct spi_dt_spec sensor_imu_spi_dev = SPI_DT_SPEC_GET(SENSOR_IMU_SPI_NODE, SPI_OP);
+#endif
+#if DT_NODE_HAS_STATUS(DT_NODELABEL(imu), okay)
+#define SENSOR_IMU_EXISTS true
+#define SENSOR_IMU_NODE DT_NODELABEL(imu)
+static struct i2c_dt_spec sensor_imu_dev = I2C_DT_SPEC_GET(SENSOR_IMU_NODE);
+#else
+static struct i2c_dt_spec sensor_imu_dev = {0};
+#endif
+#if !SENSOR_IMU_SPI_EXISTS && !SENSOR_IMU_EXISTS
+#error "IMU node does not exist"
+#endif
+static uint8_t sensor_imu_dev_reg = 0xFF;
+
+#if CONFIG_SENSOR_USE_MAGNETOMETER
+#if DT_NODE_HAS_STATUS(DT_NODELABEL(mag_spi), okay)
+#define SENSOR_MAG_SPI_EXISTS true
+#define SENSOR_MAG_SPI_NODE DT_NODELABEL(mag_spi)
+static struct spi_dt_spec sensor_mag_spi_dev = SPI_DT_SPEC_GET(SENSOR_MAG_SPI_NODE, SPI_OP);
+#endif
+#if DT_NODE_HAS_STATUS(DT_NODELABEL(mag), okay)
+#define SENSOR_MAG_EXISTS true
+#define SENSOR_MAG_NODE DT_NODELABEL(mag)
+static struct i2c_dt_spec sensor_mag_dev = I2C_DT_SPEC_GET(SENSOR_MAG_NODE);
+#else
+static struct i2c_dt_spec sensor_mag_dev = {0};
+#endif
+#if SENSOR_IMU_SPI_EXISTS // might exist
+#define SENSOR_MAG_EXT_EXISTS true
+#endif
+#if !SENSOR_MAG_SPI_EXISTS && !SENSOR_MAG_EXISTS && !SENSOR_MAG_EXT_EXISTS
+#warning "Magnetometer node does not exist"
+#endif
+static uint8_t sensor_mag_dev_reg = 0xFF;
+#endif
+
+static float q[4] = {1.0f, 0.0f, 0.0f, 0.0f};      // vector to hold quaternion
+static float last_q[4] = {1.0f, 0.0f, 0.0f, 0.0f}; // vector to hold quaternion
+
+static float sensor_to_device_quat[4] = {SENSOR_QUATERNION_CORRECTION};
+static float sensor_vector_to_device_quat[4] = {1.0f, 0.0f, 0.0f, 0.0f};
+#if !SENSOR_QUATERNION_OUTPUT_BIAS_IS_IDENTITY
+static float reported_output_bias_quat[4] = {SENSOR_QUATERNION_OUTPUT_BIAS};
+#endif
+
+static float last_lin_a[3] = {0}; // vector to hold last linear accelerometer
+
+static float temp; // sensor temperature
+#if CONFIG_CONNECTION_RAW_COLLECTION
+static int64_t last_temp_time = -1000;
+#endif
+
+static bool main_ok = false;
+static int packet_errors = 0;
+
+// Detect a stuck/empty FIFO condition.
+// In some failure modes the IMU stops producing samples and we can end up spamming
+// "No packets in buffer" without raising an error.
+#define NO_PACKETS_TIMEOUT_MS 3000
+static int64_t no_packets_since_ms = 0;
+static bool no_packets_timeout_logged = false;
+/* INT fired while the loop was still draining FIFO. Next empty read is expected. */
+static bool sensor_int_during_loop = false;
+
+static int64_t last_suspend_attempt_time = 0;
+static int64_t last_data_time;
+static int64_t last_sensor_send_time = 0;
+static int64_t last_retained_save_time = 0;
+
+#if CONFIG_DYNAMIC_ACTIVE_TIMEOUT
+static bool sensor_wom_history_initialized;
+static bool sensor_session_woke_from_wom;
+static bool sensor_session_meaningful_motion;
+static struct sensor_activity_score sensor_session_activity_score = {.last_update_ms = -1};
+#endif
+
+// Track forced scan requests to allow override when requested 3 times within 1 minute
+#define FORCE_SCAN_WINDOW_MS 60000 // 1 minute window
+#define FORCE_SCAN_THRESHOLD 3     // 3 requests needed
+static int64_t force_scan_request_times[3] = {0};
+static int force_scan_request_count = 0;
+
+// Periodic retained save interval (ms) for crash recovery
+#define RETAINED_SAVE_INTERVAL_MS 5000
+
+#if CONFIG_SENSOR_USE_MAGNETOMETER
+/* Nominal deadline is the fallback; safe cached frames may be consumed early. */
+static int64_t mag_read_period_ticks = 1;
+static int64_t next_mag_read_ticks;
+/* Wall-clock tick of the most recent successful fusion feed. */
+static int64_t last_mag_fusion_ticks;
+#endif
+
+static float accel_actual_time;
+static float gyro_actual_time;
+#if CONFIG_SENSOR_USE_MAGNETOMETER
+static float mag_actual_time;
+#endif
+int sensor_update_time_ms = 6;
+
+#if CONFIG_SENSOR_USE_MAGNETOMETER
+static void sensor_mag_timing_reset(void)
+{
+	next_mag_read_ticks = 0;
+	last_mag_fusion_ticks = 0;
+}
+
+static void sensor_mag_timing_configure(void)
+{
+	mag_read_period_ticks = 1;
+	if (isfinite(mag_actual_time) && mag_actual_time > 0.0f) {
+		uint64_t period_us = (uint64_t)ceil((double)mag_actual_time * 1000000.0);
+		mag_read_period_ticks = MAX((int64_t)k_us_to_ticks_ceil64(MAX(period_us, 1)), 1);
+	}
+	sensor_mag_timing_reset();
+}
+#endif
+
+#if CONFIG_SENSOR_USE_LOW_POWER_2
+#define SENSOR_FIFO_RAW_BUFFER_SIZE 2048
+#elif CONFIG_SENSOR_GYRO_OVERSAMPLING > 1
+#define SENSOR_FIFO_RAW_BUFFER_SIZE 1536
+#else
+#define SENSOR_FIFO_RAW_BUFFER_SIZE 1024
+#endif
+
+static uint8_t sensor_fifo_raw_buffer[SENSOR_FIFO_RAW_BUFFER_SIZE]
+#ifdef CONFIG_DCACHE_LINE_SIZE
+	__aligned(CONFIG_DCACHE_LINE_SIZE)
+#endif
+		;
+
+/*
+ * Runtime INT_merge factor. Defaults to CONFIG_SENSOR_GYRO_OVERSAMPLING.
+ * On I2C IMU, forced to 1 and chip ODR is requested at the intended fusion
+ * rate (ODR/N) — 400 kHz I2C cannot sustain hi-res FIFO at 1600 Hz.
+ */
+static uint8_t gyro_oversample_n = CONFIG_SENSOR_GYRO_OVERSAMPLING;
+
+#if CONFIG_SENSOR_GYRO_OVERSAMPLING > 1
+/*
+ * INT_merge: high-rate Δq product → one fusion gyro step at ODR/N.
+ *
+ * Two bias layers (do not mix):
+ *  1) Firmware: process_gyro (TCal / static gyroBias / D_offset) + sens scale
+ *     applied per sample into `g` before merge.
+ *  2) Fusion: VQF/EqF residual bias, frozen for the N-sample window, subtracted
+ *     when building each Δq, then re-added on the fed ω_eq so update_gyro's
+ *     internal subtract recovers the debiased equivalent rate.
+ * Never re-add firmware offsets on the feed path — fusion never sees them.
+ */
+/* float enough: N≤16 near-identity Δq; Cortex-M4/M33 FPU is SP-only */
+#define GYRO_DQ_EPS 1e-8f
+#define GYRO_DQ_HALF_TAYLOR 1e-4f /* |θ/2| below this → sinc/cos Taylor */
+static float gyro_dq_acc[4];
+static int gyro_oversample_count = 0;
+static float gyro_effective_time;    /* N * gyro_actual_time */
+static float gyro_merge_bias_dps[3]; /* frozen fusion bias for one window */
+#endif
+
+#if CONFIG_SENSOR_ACCEL_OVERSAMPLING > 1
+// Accelerometer oversampling state for noise reduction
+// Accumulates accel samples and averages them before fusion
+static float accel_oversample_sum[3] = {0};
+static int accel_oversample_count = 0;
+static float accel_effective_time; // Effective time step for fusion after oversampling
+#endif
+
+static float accel_actual_range; // Actual accelerometer full scale range (g)
+static float gyro_actual_range;  // Actual gyroscope full scale range (deg/s)
+
+static atomic_t fusion_requests;
+static atomic_t output_ready;
+static struct k_spinlock fusion_feedback_lock;
+static struct led_token fusion_feedback;
+static struct led_token initialization_feedback;
+#define FUSION_REQUEST_RESET BIT(1)
+
+#if CONFIG_CONNECTION_RAW_COLLECTION
+static void sensor_send_raw_metadata(void);
+#endif
+
+static float sensor_actual_time;
+static int16_t sensor_fifo_threshold;
+static bool sensor_fast_first_update_pending;
+static bool sensor_wom_fast_wake_resume_pending;
+
+static bool sensor_fusion_init;
+static bool sensor_sensor_init;
+
+static atomic_t main_suspended;
+/*
+ * The lifecycle mutex owns thread creation/join and suspension leases.  The
+ * activity mutex is held by the loop from before initialization through each
+ * complete iteration; a suspend is successful only after acquiring it.
+ */
+static K_MUTEX_DEFINE(sensor_lifecycle_lock);
+static K_MUTEX_DEFINE(sensor_activity_lock);
+static K_SEM_DEFINE(sensor_loop_gate, 0, 1);
+static atomic_t sensor_loop_stop;
+/* Existing static power thread is the only owner after terminal shutdown. */
+extern const k_tid_t power_thread_id;
+static k_tid_t sensor_suspend_owner;
+enum sensor_thread_role {
+	SENSOR_THREAD_NONE,
+	SENSOR_THREAD_SCAN,
+	SENSOR_THREAD_LOOP,
+};
+static enum sensor_thread_role sensor_thread_role;
+
+#ifndef SENSOR_LIFECYCLE_LOCK_TIMEOUT_MS
+#define SENSOR_LIFECYCLE_LOCK_TIMEOUT_MS 10000
+#endif
+#ifndef SENSOR_ACTIVITY_TIMEOUT_MS
+#define SENSOR_ACTIVITY_TIMEOUT_MS 5000
+#endif
+
+static bool sensor_loop_enter(void)
+{
+	for (;;) {
+		k_mutex_lock(&sensor_activity_lock, K_FOREVER);
+		if (atomic_get(&sensor_loop_stop)) {
+			k_mutex_unlock(&sensor_activity_lock);
+			return false;
+		}
+		if (!atomic_get(&main_suspended)) {
+			return true;
+		}
+		k_mutex_unlock(&sensor_activity_lock);
+		k_sem_take(&sensor_loop_gate, K_FOREVER);
+	}
+}
+
+static void sensor_loop_leave(void)
+{
+	k_mutex_unlock(&sensor_activity_lock);
+}
+
+static int sensor_lifecycle_lock_take(void)
+{
+	int err = k_mutex_lock(&sensor_lifecycle_lock, K_MSEC(SENSOR_LIFECYCLE_LOCK_TIMEOUT_MS));
+	return err ? -ETIMEDOUT : 0;
+}
+
+static int sensor_activity_quiesce(void)
+{
+	int err = k_mutex_lock(&sensor_activity_lock, K_MSEC(SENSOR_ACTIVITY_TIMEOUT_MS));
+	return err ? -ETIMEDOUT : 0;
+}
+
+
+bool main_imu_is_suspended(void)
+{
+	return atomic_get(&main_suspended) != 0;
+}
+static bool main_running = false;
+
+/* Idle publication also serves the calibration scheduling hint. */
+static K_EVENT_DEFINE(sensor_life_events);
+#define SENSOR_LIFE_IDLE BIT(0)
+
+static int sensor_life_events_init(void)
+{
+	k_event_set(&sensor_life_events, SENSOR_LIFE_IDLE);
+	return 0;
+}
+SYS_INIT(sensor_life_events_init, APPLICATION, 0);
+
+static void sensor_life_mark_idle(void)
+{
+	main_running = false;
+	k_event_post(&sensor_life_events, SENSOR_LIFE_IDLE);
+}
+
+static void sensor_life_mark_busy(void)
+{
+	k_event_clear(&sensor_life_events, SENSOR_LIFE_IDLE);
+	main_running = true;
+}
+
+
+#if CONFIG_SENSOR_USE_MAGNETOMETER
+static bool mag_available;
+static bool mag_enabled;    // initialized from retained->mag_enabled in sensor_scan()
+static bool mag_calibrated; // true if magnetometer calibration data is valid
+static atomic_t mag_persistence_error;
+/* Closed until the changed magnetic domain has restarted and rebased. */
+static bool skip_fusion_save;
+static bool mag_fusion_restarted;
+static atomic_t mag_fusion_finish_pending;
+static unsigned int mag_setting_writes;
+static K_MUTEX_DEFINE(mag_fusion_lock);
+#endif
+
+struct fusion_periods {
+	float gyro;
+	float accel;
+	float mag;
+};
+
+static struct fusion_periods sensor_fusion_periods(void)
+{
+	struct fusion_periods periods = {
+		.gyro = gyro_actual_time * (float)gyro_oversample_n,
+		.accel = accel_actual_time * CONFIG_SENSOR_ACCEL_OVERSAMPLING,
+		.mag = 0.0f,
+	};
+#if CONFIG_SENSOR_USE_MAGNETOMETER
+	if (mag_available && mag_enabled) {
+		periods.mag = mag_actual_time > 0.0f && mag_actual_time < 10.0f
+			? mag_actual_time : 1.0f / CONFIG_SENSOR_MAG_ODR;
+	}
+#endif
+	return periods;
+}
+
+#if CONFIG_SENSOR_USE_VQF
+static const sensor_fusion_t *sensor_fusion = &sensor_fusion_vqf; // TODO: change from server
+int fusion_id = FUSION_VQF;
+#elif CONFIG_SENSOR_USE_EQF
+static const sensor_fusion_t *sensor_fusion = &sensor_fusion_eqf;
+int fusion_id = FUSION_EQF;
+#endif
+
+#if CONFIG_SENSOR_USE_MAGNETOMETER
+bool sensor_fusion_get_mag_dist_detected(void)
+{
+	if (!sensor_fusion || !sensor_fusion->get_mag_dist_detected) {
+		return false;
+	}
+	return sensor_fusion->get_mag_dist_detected();
+}
+
+/* Cross-thread callers request a handoff; only the sensor thread touches fusion. */
+static struct k_spinlock mag_ref_request_lock;
+static bool mag_ref_request_pending;
+static float mag_ref_request_norm;
+static float mag_ref_request_dip;
+
+void sensor_fusion_set_mag_ref(float norm, float dip)
+{
+	k_spinlock_key_t key = k_spin_lock(&mag_ref_request_lock);
+	mag_ref_request_norm = norm;
+	mag_ref_request_dip = dip;
+	mag_ref_request_pending = true;
+	k_spin_unlock(&mag_ref_request_lock, key);
+}
+
+void sensor_fusion_reset_mag_ref(void)
+{
+	sensor_fusion_set_mag_ref(0.0f, 0.0f);
+}
+
+static void sensor_service_mag_ref(void)
+{
+	float norm, dip;
+	k_spinlock_key_t key = k_spin_lock(&mag_ref_request_lock);
+	bool pending = mag_ref_request_pending;
+	norm = mag_ref_request_norm;
+	dip = mag_ref_request_dip;
+	mag_ref_request_pending = false;
+	k_spin_unlock(&mag_ref_request_lock, key);
+	/* Matrix publication in this sample takes precedence over an older request. */
+	pending = magneto_online_take_mag_ref(&norm, &dip) || pending;
+	if (pending && sensor_fusion->rebase_mag) {
+		if (!isfinite(norm) || !isfinite(dip) || norm <= 0.0f || fabsf(dip) > (float)M_PI / 2.0f) {
+			norm = dip = 0.0f;
+		}
+		sensor_fusion->rebase_mag(norm, dip);
+		last_mag_fusion_ticks = 0;
+	}
+}
+
+/* The sensor owner or the suspended lifecycle owner holds fusion exclusively. */
+static void sensor_finish_mag_fusion_restart(bool restarted)
+{
+	k_mutex_lock(&mag_fusion_lock, K_FOREVER);
+	if (skip_fusion_save && restarted) {
+		mag_fusion_restarted = true;
+	}
+	if (skip_fusion_save && mag_fusion_restarted && !mag_setting_writes &&
+	    mag_enabled == retained->mag_enabled) {
+		sensor_fusion_reset_mag_ref();
+		sensor_service_mag_ref();
+		skip_fusion_save = false;
+		mag_fusion_restarted = false;
+		atomic_clear(&mag_fusion_finish_pending);
+	}
+	k_mutex_unlock(&mag_fusion_lock);
+}
+
+static void sensor_service_pending_mag_fusion(void)
+{
+	if (atomic_cas(&mag_fusion_finish_pending, 1, 0)) {
+		sensor_finish_mag_fusion_restart(false);
+	}
+}
+
+bool sensor_fusion_get_mag_ref(float *norm, float *dip)
+{
+	if (!sensor_fusion || !sensor_fusion->get_mag_ref || !norm || !dip) {
+		return false;
+	}
+	sensor_fusion->get_mag_ref(norm, dip);
+	return true;
+}
+#endif
+
+static int sensor_imu_id = -1;
+#if CONFIG_SENSOR_USE_MAGNETOMETER
+static int sensor_mag_id = -1;
+#endif
+static const sensor_imu_t *sensor_imu = &sensor_imu_none;
+#if CONFIG_SENSOR_USE_MAGNETOMETER
+static const sensor_mag_t *sensor_mag = &sensor_mag_none;
+#endif
+
+#if CONFIG_SENSOR_USE_TCAL
+/* Single LPF: τ=500ms without active curve, τ=100ms when LUT/MLS apply ready. */
+#ifndef SENSOR_TCAL_TEMP_FILTER_TAU_MS
+#define SENSOR_TCAL_TEMP_FILTER_TAU_MS 500 // ms — ZRO / collect / display
+#endif
+#ifndef SENSOR_TCAL_TEMP_CURVE_TAU_MS
+#define SENSOR_TCAL_TEMP_CURVE_TAU_MS 100 // ms — when curve compensation active
+#endif
+
+static float sensor_tcal_temp = 25.0f;
+static float sensor_tcal_temp_raw = 25.0f;
+static bool sensor_tcal_temp_filter_initialized = false;
+static int64_t sensor_tcal_temp_filter_last_ms = 0;
+#endif
+
+#if CONFIG_SENSOR_TCAL_HEATED
+static struct k_spinlock temperature_observation_lock;
+static K_MUTEX_DEFINE(temperature_lifecycle_lock);
+static struct sensor_temperature_observation temperature_observation;
+static bool temperature_observation_valid;
+static bool temperature_observation_enabled;
+static uint32_t temperature_filter_epoch;
+static uint32_t temperature_epoch;
+static bool heated_resting;
+
+int sensor_get_imu_temperature_observation(
+	struct sensor_temperature_observation *out, int64_t max_age_ms)
+{
+	if (!out || max_age_ms < 0) {
+		return -EINVAL;
+	}
+	k_spinlock_key_t key = k_spin_lock(&temperature_observation_lock);
+	struct sensor_temperature_observation sample = temperature_observation;
+	bool valid = temperature_observation_valid;
+	k_spin_unlock(&temperature_observation_lock, key);
+	int64_t age = k_uptime_get() - sample.sampled_at_ms;
+	if (!valid || age < 0 || age > max_age_ms) {
+		return -EAGAIN;
+	}
+	*out = sample;
+	return 0;
+}
+
+static int sensor_temperature_invalidate(void)
+{
+	/* Never enter from a calibration/core lock: closing admission may take
+	 * the shared request gate and synchronously stop the PWM. */
+	k_mutex_lock(&temperature_lifecycle_lock, K_FOREVER);
+	k_spinlock_key_t key = k_spin_lock(&temperature_observation_lock);
+	temperature_observation_valid = false;
+	temperature_observation_enabled = false;
+	temperature_epoch++;
+	k_spin_unlock(&temperature_observation_lock, key);
+	int err = sensor_tcal_heated_abort(TCAL_HEATED_STOP_SENSOR_STOP);
+	k_mutex_unlock(&temperature_lifecycle_lock);
+	return err;
+}
+
+static void sensor_temperature_resume(void)
+{
+	k_mutex_lock(&temperature_lifecycle_lock, K_FOREVER);
+	k_spinlock_key_t key = k_spin_lock(&temperature_observation_lock);
+	temperature_observation_enabled = main_ok && !atomic_get(&main_suspended);
+	temperature_observation_valid = false;
+	temperature_epoch++;
+	k_spin_unlock(&temperature_observation_lock, key);
+	k_mutex_unlock(&temperature_lifecycle_lock);
+}
+
+static uint32_t sensor_temperature_read_epoch(void)
+{
+	k_spinlock_key_t key = k_spin_lock(&temperature_observation_lock);
+	uint32_t epoch = temperature_epoch;
+	k_spin_unlock(&temperature_observation_lock, key);
+	return epoch;
+}
+
+static void sensor_temperature_publish(uint32_t epoch, int64_t sampled_at_ms)
+{
+	k_mutex_lock(&temperature_lifecycle_lock, K_FOREVER);
+	k_spinlock_key_t key = k_spin_lock(&temperature_observation_lock);
+	bool accepted = temperature_observation_enabled && epoch == temperature_epoch
+		&& main_ok && !atomic_get(&main_suspended)
+		&& v_finite(&sensor_tcal_temp_raw, 1) && v_finite(&sensor_tcal_temp, 1)
+		&& sensor_tcal_temp_raw > -20.0f && sensor_tcal_temp_raw < 60.0f
+		&& sensor_tcal_temp > -20.0f && sensor_tcal_temp < 60.0f;
+	if (accepted) {
+		temperature_observation.raw_c = sensor_tcal_temp_raw;
+		temperature_observation.filtered_c = sensor_tcal_temp;
+		temperature_observation.sampled_at_ms = sampled_at_ms;
+		temperature_observation.sequence++;
+		temperature_observation_valid = true;
+	}
+	k_spin_unlock(&temperature_observation_lock, key);
+	if (accepted && heater_power_ready() && !esb_ota_is_active() && !connection_get_ota_suppressed()) {
+		sensor_tcal_heated_set_ready(true);
+	}
+	k_mutex_unlock(&temperature_lifecycle_lock);
+}
+#endif
+
+// #define DEBUG true
+
+#if DEBUG
+LOG_MODULE_REGISTER(sensor, LOG_LEVEL_DBG);
+#else
+LOG_MODULE_REGISTER(sensor, LOG_LEVEL_INF);
+#endif
+
+#include "system/nrf_gpio_util.h" /* after LOG_MODULE_REGISTER: pin log helpers */
+
+/* 10 % above the 50 ms the IMUs need: one Smol missed its IMU on most boots. */
+#define SENSOR_SCAN_COLD_POWER_UP_DELAY_MS 55
+
+static int sensor_scan_last_power_up_delay_ms = SENSOR_SCAN_COLD_POWER_UP_DELAY_MS;
+
+static uint16_t sensor_fifo_setup_threshold(void)
+{
+	if (sensor_fast_first_update_pending && sensor_fifo_threshold > 1) {
+		return 1;
+	}
+	return (uint16_t)sensor_fifo_threshold;
+}
+
+#if CONFIG_SENSOR_FAST_WOM_WAKE && NRF_POWER_HAS_GPREGRET                                                              \
+	&& (defined(POWER_GPREGRET2_GPREGRET_Msk) || defined(POWER_GPREGRET_MaxCount))
+static bool sensor_consume_wom_fast_wake_hint(void)
+{
+	if (nrf_power_gpregret_get(NRF_POWER, 1) != SENSOR_WOM_FAST_WAKE_GPREGRET) {
+		return false;
+	}
+	nrf_power_gpregret_set(NRF_POWER, 1, 0);
+	return true;
+}
+#else
+static bool sensor_consume_wom_fast_wake_hint(void)
+{
+	return false;
+}
+#endif
+
+static bool sensor_imu_fast_wom_wake_supported(void)
+{
+#if IS_ENABLED(CONFIG_SENSOR_DRV_LSM6DSV)
+	if (sensor_imu == &sensor_imu_lsm6dsv) {
+		return true;
+	}
+#endif
+#if IS_ENABLED(CONFIG_SENSOR_DRV_ICM45686)
+	if (sensor_imu == &sensor_imu_icm45686) {
+		return true;
+	}
+#endif
+	return false;
+}
+
+static inline void sensor_compute_device_quat(const float *fused_quat, float *device_quat)
+{
+	q_multiply(fused_quat, sensor_to_device_quat, device_quat);
+}
+
+static inline void sensor_compute_reported_quat(const float *device_quat, float *reported_quat)
+{
+#if SENSOR_QUATERNION_OUTPUT_BIAS_IS_IDENTITY
+	memcpy(reported_quat, device_quat, sizeof(float) * 4);
+#else
+	q_multiply(reported_output_bias_quat, device_quat, reported_quat);
+#endif
+}
+
+static inline void sensor_update_frame_transform_cache(void)
+{
+	// Orientation uses Qdevice = Qfused * Qcorr. For active vector rotation from
+	// sensor frame into device frame, we need the inverse of that basis correction.
+	q_conj(sensor_to_device_quat, sensor_vector_to_device_quat);
+}
+
+void
+sensor_compute_device_and_reported_quat(const float *fused_quat, float *device_quat, float *reported_quat)
+{
+	sensor_compute_device_quat(fused_quat, device_quat);
+	sensor_compute_reported_quat(device_quat, reported_quat);
+}
+
+static inline void sensor_rotate_sensor_vector_to_device_frame(const float *sensor_vector, float *device_vector)
+{
+	v_rotate(sensor_vector, sensor_vector_to_device_quat, device_vector);
+}
+
+/* Upper-motion state is owned exclusively by the sensor thread. Lifecycle
+ * callers invalidate the event epoch; they never reset these filters. */
+static struct sensor_rest_detector rest_detector;
+static struct {
+	uint32_t epoch;
+	bool epoch_valid, initialized, resting, previous_valid, frame_invalid;
+	int64_t gyro_ms, accel_ms, frame_ms, previous_ms;
+	uint32_t quiet_ms, motion_ms;
+	float reference_q[4], previous_q[4];
+} sensor_motion_state = {.gyro_ms = -1, .accel_ms = -1, .frame_ms = -1};
+
+static void sensor_motion_reset(void)
+{
+	memset(&sensor_motion_state, 0, sizeof(sensor_motion_state));
+	sensor_motion_state.gyro_ms = sensor_motion_state.accel_ms = sensor_motion_state.frame_ms = -1;
+	sensor_rest_detector_reset(&rest_detector);
+#if CONFIG_DYNAMIC_ACTIVE_TIMEOUT
+	/* Discard partial credit, not the one-way meaningful-session latch. */
+	sensor_session_activity_score.value_ms = 0;
+	sensor_session_activity_score.last_update_ms = -1;
+#endif
+}
+
+static bool sensor_motion_frame_current(uint32_t epoch)
+{
+	return !atomic_get(&main_suspended) && epoch == tracker_events_sensor_epoch();
+}
+
+static uint32_t sensor_motion_freshness_ms(float period_s)
+{
+	/* Two effective fusion/merge periods or two configured loop intervals,
+	 * whichever is slower, plus the existing 10ms missed-IRQ polling slack.
+	 * Clock: observed k_uptime_get() milliseconds, not nominal sample time.
+	 * This admits 33/100ms batching and short lower-ODR holds without allowing
+	 * a stopped channel to refresh itself from the other channel's samples. */
+	if (!v_finite(&period_s, 1) || period_s <= 0.0f) {
+		return 0;
+	}
+	return (uint32_t)ceilf(2000.0f * fmaxf(period_s, sensor_update_time_ms / 1000.0f)) + 10;
+}
+
+static uint32_t sensor_motion_gyro_freshness_ms(void)
+{
+#if CONFIG_SENSOR_GYRO_OVERSAMPLING > 1
+	return sensor_motion_freshness_ms(gyro_effective_time);
+#else
+	return sensor_motion_freshness_ms(gyro_actual_time);
+#endif
+}
+
+static uint32_t sensor_motion_accel_freshness_ms(void)
+{
+#if CONFIG_SENSOR_ACCEL_OVERSAMPLING > 1
+	return sensor_motion_freshness_ms(accel_effective_time);
+#else
+	return sensor_motion_freshness_ms(accel_actual_time);
+#endif
+}
+
+static bool sensor_motion_channel_expired(int64_t at, int64_t now, uint32_t limit)
+{
+	return at >= 0 && (now < at || now - at > limit);
+}
+
+static void sensor_motion_prepare(uint32_t epoch, int64_t now)
+{
+	if (!sensor_motion_state.epoch_valid || sensor_motion_state.epoch != epoch
+		|| !sensor_motion_frame_current(epoch)
+		|| sensor_motion_channel_expired(sensor_motion_state.gyro_ms, now, sensor_motion_gyro_freshness_ms())
+		|| sensor_motion_channel_expired(sensor_motion_state.accel_ms, now, sensor_motion_accel_freshness_ms())) {
+		sensor_motion_reset();
+		sensor_motion_state.epoch = epoch;
+		sensor_motion_state.epoch_valid = true;
+	}
+	sensor_motion_state.frame_invalid = false;
+}
+
+static float sensor_motion_quat_angle(const float a[4], const float b[4])
+{
+	/* Vector of conj(a)*b keeps sub-milliradian rotations that acos(dot)
+	 * loses in float at a 6ms cadence. abs(scalar) identifies q and -q. */
+	float x = a[0]*b[1] - a[1]*b[0] - a[2]*b[3] + a[3]*b[2];
+	float y = a[0]*b[2] + a[1]*b[3] - a[2]*b[0] - a[3]*b[1];
+	float z = a[0]*b[3] - a[1]*b[2] + a[2]*b[1] - a[3]*b[0];
+	float w = a[0]*b[0] + a[1]*b[1] + a[2]*b[2] + a[3]*b[3];
+	return 2.0f * atan2f(sqrtf(x*x + y*y + z*z), fabsf(w));
+}
+
+/* current_q has been validated and normalized once by the publisher. */
+static bool sensor_motion_observe(
+	uint32_t epoch, int g_count, int a_count, float current_q[4],
+	const float lin_a[3], int64_t now, bool *resting, float *speed, float *linear)
+{
+	*resting = false;
+	*speed = -1.0f; /* No completed activity window. */
+	*linear = 0.0f;
+	struct sensor_rest_evidence evidence;
+	sensor_rest_detector_take(&rest_detector, &evidence);
+	float norm2 = current_q[0]*current_q[0] + current_q[1]*current_q[1]
+		+ current_q[2]*current_q[2] + current_q[3]*current_q[3];
+	if (!sensor_motion_frame_current(epoch) || !sensor_motion_state.epoch_valid || sensor_motion_state.epoch != epoch
+		|| sensor_motion_state.frame_invalid || !v_finite(current_q, 4)
+		|| !v_finite(&norm2, 1) || norm2 <= 0.0f || !v_finite(lin_a, 3)
+		|| (a_count > 0 && !evidence.accel_valid)) {
+		sensor_motion_reset();
+		return false;
+	}
+	if (g_count > 0) sensor_motion_state.gyro_ms = now;
+	if (a_count > 0) sensor_motion_state.accel_ms = now;
+	int64_t elapsed = sensor_motion_state.frame_ms < 0 ? 0 : now - sensor_motion_state.frame_ms;
+	sensor_motion_state.frame_ms = now;
+	bool known = sensor_motion_state.gyro_ms >= 0 && sensor_motion_state.accel_ms >= 0
+		&& evidence.accel_valid
+		&& !sensor_motion_channel_expired(sensor_motion_state.gyro_ms, now, sensor_motion_gyro_freshness_ms())
+		&& !sensor_motion_channel_expired(sensor_motion_state.accel_ms, now, sensor_motion_accel_freshness_ms());
+	if (!known) {
+		sensor_motion_state.initialized = sensor_motion_state.resting = sensor_motion_state.previous_valid = false;
+		sensor_motion_state.quiet_ms = sensor_motion_state.motion_ms = 0;
+		return false;
+	}
+	if (g_count == 0 && a_count == 0) {
+		/* Held values may remain valid, but an empty frame earns no dwell or
+		 * activity credit and cannot refresh external observations. */
+		*resting = sensor_motion_state.resting;
+		sensor_motion_state.previous_valid = false;
+		return false;
+	}
+	float squared = lin_a[0]*lin_a[0] + lin_a[1]*lin_a[1] + lin_a[2]*lin_a[2];
+	if (!v_finite(&squared, 1)) {
+		sensor_motion_reset();
+		return false;
+	}
+	*linear = sqrtf(squared);
+	if (!sensor_motion_state.initialized) {
+		memcpy(sensor_motion_state.reference_q, current_q, sizeof(sensor_motion_state.reference_q));
+		sensor_motion_state.initialized = true;
+		elapsed = 0;
+	}
+#if CONFIG_DYNAMIC_ACTIVE_TIMEOUT
+	if (sensor_session_woke_from_wom && !sensor_session_meaningful_motion) {
+		/* Activity alone uses a >=100ms net-angle window: frame-to-frame
+		 * quaternion noise must not amplify into meaningful movement. */
+		if (sensor_motion_state.previous_valid && now - sensor_motion_state.previous_ms >= 100) {
+			*speed = sensor_motion_quat_angle(sensor_motion_state.previous_q, current_q)
+				* (180000.0f / (float)M_PI) / (float)(now - sensor_motion_state.previous_ms);
+			sensor_motion_state.previous_valid = false;
+		}
+		if (!sensor_motion_state.previous_valid) {
+			memcpy(sensor_motion_state.previous_q, current_q, sizeof(sensor_motion_state.previous_q));
+			sensor_motion_state.previous_ms = now;
+			sensor_motion_state.previous_valid = true;
+		}
+	}
+#endif
+	float angle = sensor_motion_quat_angle(sensor_motion_state.reference_q, current_q);
+	uint32_t dt = elapsed > 0 ? (uint32_t)elapsed : 0;
+	if (sensor_motion_state.resting) {
+		if (sensor_motion_is_active(*linear, angle, &evidence)) {
+			/* Start the high-threshold dwell at this observation. */
+			if (sensor_motion_state.motion_ms == 0) sensor_motion_state.motion_ms = 1;
+			else sensor_motion_state.motion_ms += dt;
+			if (sensor_motion_state.motion_ms > SENSOR_REST_EXIT_MOTION_MS) {
+				sensor_motion_state.resting = false;
+				sensor_motion_state.quiet_ms = sensor_motion_state.motion_ms = 0;
+				memcpy(sensor_motion_state.reference_q, current_q, sizeof(sensor_motion_state.reference_q));
+			}
+		} else {
+			sensor_motion_state.motion_ms = 0;
+		}
+	} else if (sensor_motion_is_quiet(*linear, angle, &evidence)) {
+		if (sensor_motion_state.quiet_ms == 0) sensor_motion_state.quiet_ms = 1;
+		else sensor_motion_state.quiet_ms += dt;
+		if (sensor_motion_state.quiet_ms > SENSOR_REST_ENTER_STABLE_MS) {
+			sensor_motion_state.resting = true;
+			sensor_motion_state.motion_ms = 0;
+			/* Start the fixed resting reference at the confirmed pose. */
+			memcpy(sensor_motion_state.reference_q, current_q, sizeof(sensor_motion_state.reference_q));
+		}
+	} else {
+		sensor_motion_state.quiet_ms = sensor_motion_state.motion_ms = 0;
+		memcpy(sensor_motion_state.reference_q, current_q, sizeof(sensor_motion_state.reference_q));
+	}
+	*resting = sensor_motion_state.resting;
+	return true;
+}
+
+static int sensor_scan(void);
+static void sensor_scan_read(void);
+static void sensor_scan_write(void);
+static void sensor_scan_clear(void);
+static int sensor_init(void);
+static void sensor_loop(void);
+static struct k_thread sensor_thread_id;
+static K_THREAD_STACK_DEFINE(sensor_thread_id_stack, 2048);
+
+/* Only the sensor worker reports progress. The monitor never touches the bus
+ * until the existing lifecycle has quiesced and joined that worker. */
+static atomic_t sensor_progress;
+static atomic_t sensor_recovery_pending;
+
+static void sensor_startup_thread(void *arg1, void *arg2, void *arg3)
+{
+	ARG_UNUSED(arg1);
+	ARG_UNUSED(arg2);
+	ARG_UNUSED(arg3);
+	unsigned delay_ms = 2000;
+	unsigned stalled = 0;
+	int err = sensor_request_scan(true, false);
+	for (;;) {
+		if (err) {
+			LOG_WRN("Sensor discovery failed; retry in %u ms", delay_ms);
+			k_msleep(delay_ms);
+			delay_ms = delay_ms < 16000 ? delay_ms * 2 : 30000;
+		} else {
+			delay_ms = 2000;
+			k_msleep(1000);
+			/* Suspended sensors deliberately produce no data. Without a pending
+			 * recovery, progress resets the grace interval after resume,
+			 * calibration or a successful scan. */
+			if (atomic_get(&main_suspended) ||
+			    (atomic_set(&sensor_progress, 0) && !atomic_get(&sensor_recovery_pending))) {
+				stalled = 0;
+				continue;
+			}
+			if (++stalled < 3 && !atomic_get(&sensor_recovery_pending)) {
+				continue;
+			}
+			LOG_WRN("Sensor data stalled; requesting full rescan");
+			atomic_set(&sensor_recovery_pending, 1);
+		}
+		err = sensor_request_scan(true, false);
+		stalled = 0;
+	}
+}
+
+/* Peak use is ~330 B; an interrupt taken there also stacks an extended FP
+ * frame (~104 B), which overflowed 384 B on nRF54L15. */
+K_THREAD_DEFINE(
+	sensor_init_thread_id,
+	1024,
+	sensor_startup_thread,
+	NULL,
+	NULL,
+	NULL,
+	SENSOR_REQUEST_SCAN_THREAD_PRIORITY,
+	0,
+	0
+);
+
+#define ZEPHYR_USER_NODE DT_PATH(zephyr_user)
+
+#if DT_NODE_HAS_PROP(ZEPHYR_USER_NODE, int0_gpios)
+#define IMU_INT_EXISTS true
+static const struct gpio_dt_spec int0 = GPIO_DT_SPEC_GET(ZEPHYR_USER_NODE, int0_gpios);
+#endif
+
+const char *sensor_get_sensor_imu_name(void)
+{
+	if (sensor_imu_id < 0) {
+		return "\033[38;5;196;1mNone\033[0m"; // color 196 (bright red), intense/bold
+	}
+	return dev_imu_names[sensor_imu_id];
+}
+
+bool sensor_is_initialized(void)
+{
+	return sensor_sensor_init;
+}
+
+bool sensor_output_ready(void)
+{
+	return atomic_get(&output_ready) && main_ok && sensor_fusion_init &&
+		!atomic_get(&main_suspended) && sensor_calibration_imu_ready();
+}
+
+#if CONFIG_SENSOR_USE_MAGNETOMETER
+static const char *sensor_mag_display_name(int mag_id, uint16_t addr)
+{
+	if (mag_id == MAG_QMC6309 && (addr & 0x7f) == 0x0c) {
+		return "QMC6309H";
+	}
+	return dev_mag_names[mag_id];
+}
+#endif
+
+const char *sensor_get_sensor_mag_name(void)
+{
+#if CONFIG_SENSOR_USE_MAGNETOMETER
+	if (sensor_mag_id < 0) {
+		return "None";
+	}
+	return sensor_mag_display_name(sensor_mag_id, sensor_mag_dev.addr);
+#else
+	return "None";
+#endif
+}
+
+const char *sensor_get_sensor_fusion_name(void)
+{
+	if (fusion_id < 0) {
+		return "None";
+	}
+	return fusion_names[fusion_id];
+}
+
+static void sensor_scan_thread(void)
+{
+	/* The sensor loop only registers WDT_CHANNEL_SENSOR after sensor_init()
+	 * succeeds; discovery/init itself was previously unmonitored. Cover this
+	 * phase so a blocked sensor bus reboots instead of freezing forever. */
+	if (watchdog_register_thread(WDT_CHANNEL_SCAN, 0) < 0) {
+		LOG_ERR("Scan watchdog registration failed");
+		sys_reboot(SYS_REBOOT_COLD);
+		return;
+	}
+
+	int err = sys_interface_resume();
+	if (!err) {
+		err = sensor_scan();
+	}
+	int suspend_err = sys_interface_suspend();
+	if (err || suspend_err) {
+		sensor_sensor_init = false;
+		set_sensor_fault(SYS_SENSOR_FAULT_OTHER);
+	}
+
+	/* Handoff: sensor_loop re-registers WDT_CHANNEL_SENSOR. Remove this
+	 * one-shot channel so a later boot/rescan starts from a clean slot. */
+	watchdog_pause(WDT_CHANNEL_SCAN);
+}
+
+static int sensor_scan_imu_once(void)
+{
+	int imu_id = -1;
+#if SENSOR_IMU_SPI_EXISTS
+	/* Bitbang has no controller frequency clamp; retain its DT validation cap. */
+#if DT_NODE_HAS_COMPAT(DT_BUS(SENSOR_IMU_SPI_NODE), zephyr_spi_bitbang)
+	sensor_imu_spi_dev.config.frequency = MIN(MHZ(10), DT_PROP(SENSOR_IMU_SPI_NODE, spi_max_frequency));
+#else
+	sensor_imu_spi_dev.config.frequency = MHZ(10);
+#endif
+	LOG_INF("Scanning SPI bus for IMU");
+	imu_id = sensor_scan_imu_spi(&sensor_imu_spi_dev, &sensor_imu_dev_reg);
+	if (imu_id >= 0) {
+		sensor_interface_register_sensor_imu_spi(&sensor_imu_spi_dev);
+	}
+#endif
+#if SENSOR_IMU_EXISTS
+	if (imu_id < 0) {
+		LOG_INF("Scanning I2C bus for IMU");
+		imu_id = sensor_scan_imu(&sensor_imu_dev, &sensor_imu_dev_reg);
+		if (imu_id >= 0) {
+			sensor_interface_register_sensor_imu_i2c(&sensor_imu_dev);
+		}
+	}
+#endif
+#if !SENSOR_IMU_SPI_EXISTS && !SENSOR_IMU_EXISTS
+	LOG_ERR("IMU node does not exist");
+#endif
+	return imu_id;
+}
+
+int sensor_scan(void)
+{
+	if (sensor_sensor_init) {
+		return 0; // already initialized
+	}
+#if CONFIG_DYNAMIC_ACTIVE_TIMEOUT
+	if (!sensor_wom_history_initialized) {
+		sensor_session_woke_from_wom = retained->wom_sleep_pending;
+		retained->wom_sleep_pending = false;
+		retained_update();
+		sensor_wom_history_initialized = true;
+		if (sensor_session_woke_from_wom) {
+			LOG_INF("WOM activity history: %u low-activity wakes", retained->wom_idle_wake_streak);
+		}
+	}
+#endif
+	sensor_wom_fast_wake_resume_pending = sensor_consume_wom_fast_wake_hint();
+	if (sensor_wom_fast_wake_resume_pending) {
+		LOG_INF("WOM fast-wake sensor resume requested");
+	}
+
+	sensor_scan_read();
+	// Enable external clock for IMU if hardware is available
+	float clock_actual_rate = 0;
+	int clock_err = set_sensor_clock(true, 32768, &clock_actual_rate);
+	if (clock_err == 0 && clock_actual_rate != 0) {
+		LOG_INF("Sensor clock enabled: %.2fHz", (double)clock_actual_rate);
+	}
+
+	bool retained_imu_known = sensor_imu_dev.addr != 0 || sensor_imu_dev_reg != 0xFF;
+	sensor_scan_last_power_up_delay_ms
+		= retained_imu_known ? CONFIG_SENSOR_RETAINED_SCAN_POWER_UP_DELAY_MS : SENSOR_SCAN_COLD_POWER_UP_DELAY_MS;
+	if (sensor_scan_last_power_up_delay_ms > 0) {
+		k_msleep(sensor_scan_last_power_up_delay_ms);
+	}
+
+	int imu_id = sensor_scan_imu_once();
+	/* Failed boot probes need a real power-up retry, not another 5 ms.
+	 * Keep the successful fast path unchanged. Both full rescans fit well
+	 * within the existing 10 s scan watchdog and run only after failure. */
+	for (unsigned retry = 0; imu_id < 0 && retry < 2; retry++) {
+		unsigned delay_ms = retry ? 1000U : 250U;
+		LOG_WRN("No IMU found; retrying full scan in %u ms", delay_ms);
+		k_msleep(delay_ms);
+		sensor_imu_dev.addr = 0x00;
+		sensor_imu_dev_reg = 0xFF;
+		imu_id = sensor_scan_imu_once();
+	}
+	if (imu_id >= (int)ARRAY_SIZE(dev_imu_names)) {
+		LOG_WRN("Found unknown device");
+	} else if (imu_id < 0) {
+		LOG_ERR("No IMU detected");
+	} else {
+		LOG_INF("Found %s", dev_imu_names[imu_id]);
+	}
+	if (imu_id >= 0) {
+		if (imu_id >= (int)ARRAY_SIZE(sensor_imus) || sensor_imus[imu_id] == NULL
+			|| sensor_imus[imu_id] == &sensor_imu_none) {
+			sensor_scan_clear(); // clear invalid sensor data
+			sensor_imu = &sensor_imu_none;
+			LOG_ERR("IMU not supported");
+			set_sensor_fault(SYS_SENSOR_FAULT_OTHER);
+			return -1; // an IMU was detected but not supported
+		}
+		sensor_imu = sensor_imus[imu_id];
+	} else {
+		sensor_scan_clear(); // clear invalid sensor data
+		sensor_imu = &sensor_imu_none;
+		set_sensor_fault(SYS_SENSOR_FAULT_MISSING);
+		return -1; // no IMU detected! something is very wrong
+	}
+
+#if CONFIG_SENSOR_USE_MAGNETOMETER
+	int mag_id = -1;
+#if SENSOR_MAG_SPI_EXISTS
+	const uint32_t mag_spi_hz = MIN(DT_PROP(SENSOR_MAG_SPI_NODE, spi_max_frequency), MHZ(10));
+	struct spi_dt_spec *probe_bus = &sensor_mag_spi_dev;
+#if IS_ENABLED(CONFIG_SENSOR_DRV_AK09940) && DT_PROP(SENSOR_MAG_SPI_NODE, spi_max_frequency) > 2000000
+	/* AK09940A needs >=150 ns per half-cycle. A separate config pointer lets
+	 * the controller switch from slow discovery to full speed for other chips. */
+	static struct spi_dt_spec slow_probe = SPI_DT_SPEC_GET(SENSOR_MAG_SPI_NODE, SPI_OP);
+	slow_probe.config.frequency = MHZ(2);
+	probe_bus = &slow_probe;
+#endif
+	sensor_mag_spi_dev.config.frequency = mag_spi_hz;
+	LOG_INF("Scanning SPI bus for magnetometer");
+	mag_id = sensor_scan_mag_spi(probe_bus, &sensor_mag_dev_reg);
+	if (mag_id >= 0) {
+		if (mag_id == MAG_AK09940)
+			sensor_mag_spi_dev.config.frequency = probe_bus->config.frequency;
+		sensor_interface_register_sensor_mag_spi(&sensor_mag_spi_dev);
+	}
+#endif
+#if SENSOR_MAG_EXISTS
+	if (mag_id < 0) {
+		LOG_INF("Scanning bus for magnetometer");
+		mag_id = sensor_scan_mag(&sensor_mag_dev, &sensor_mag_dev_reg);
+		if (mag_id >= 0) {
+			sensor_interface_register_sensor_mag_i2c(&sensor_mag_dev);
+		}
+	}
+	if (mag_id < 0 && !(sensor_imu_dev_reg & 0x80)) // I2C IMU
+	{
+		// IMU may support passthrough mode if the magnetometer is connected through the IMU
+		int err = sensor_imu->ext_setup(SENSOR_EXT_MODE_I2C_PASSTHROUGH); // reset later ends scan mode
+		if (!err) {
+			LOG_INF("Scanning bus for magnetometer through IMU passthrough");
+			if (sensor_mag_dev.addr > 0x80) // marked as external
+			{
+				sensor_mag_dev.addr &= 0x7F;
+				/* 0x7F+ or <8 = invalid; allow high addrs e.g. QMC6309 0x7C */
+				if (sensor_mag_dev.addr >= 0x7F || sensor_mag_dev.addr < 8) {
+					sensor_mag_dev.addr = 0x00; // reset to trigger full scan
+					sensor_mag_dev_reg = 0xFF;
+				}
+			} else {
+				sensor_mag_dev.addr = 0x00; // reset magnetometer data
+				sensor_mag_dev_reg = 0xFF;
+			}
+			mag_id = sensor_scan_mag(&sensor_mag_dev, &sensor_mag_dev_reg);
+			if (mag_id >= 0) {
+				sensor_mag_dev.addr |= 0x80;                               // mark as external
+				sensor_interface_register_sensor_mag_i2c(&sensor_mag_dev); // can register as i2c
+			}
+		}
+	}
+#endif
+#if SENSOR_MAG_EXT_EXISTS
+	if (mag_id < 0 && (sensor_imu_dev_reg & 0x80)) // SPI IMU
+	{
+		// IMU may support I2CM if the magnetometer is connected through the IMU
+		int err = sensor_imu->ext_setup(SENSOR_EXT_MODE_I2CM_PROXY);
+		if (!err) {
+			LOG_INF("Scanning bus for magnetometer through IMU I2CM");
+			if (sensor_mag_dev.addr > 0x80) // marked as external
+			{
+				sensor_mag_dev.addr &= 0x7F;
+				/* 0x7F+ or <8 = invalid; allow high addrs e.g. QMC6309 0x7C */
+				if (sensor_mag_dev.addr >= 0x7F || sensor_mag_dev.addr < 8) {
+					sensor_mag_dev.addr = 0x00; // reset to trigger full scan
+					sensor_mag_dev_reg = 0xFF;
+				}
+			} else {
+				sensor_mag_dev.addr = 0x00; // reset magnetometer data
+				sensor_mag_dev_reg = 0xFF;
+			}
+			mag_id = sensor_scan_mag_ext(sensor_interface_ext_get(), &sensor_mag_dev.addr, &sensor_mag_dev_reg);
+			if (mag_id >= 0 && mag_id < (int)ARRAY_SIZE(sensor_mags) && sensor_mags[mag_id] != NULL
+				&& sensor_mags[mag_id] != &sensor_mag_none) {
+				err = sensor_interface_register_sensor_mag_ext(
+					sensor_mag_dev.addr,
+					sensor_mags[mag_id]->ext_min_burst,
+					sensor_mags[mag_id]->ext_burst
+				);
+				sensor_mag_dev.addr |= 0x80; // mark as external
+				if (err) {
+					mag_id = -1;
+					LOG_ERR("Failed to register magnetometer external interface");
+				}
+			}
+		}
+	}
+#endif
+#if !SENSOR_MAG_SPI_EXISTS && !SENSOR_MAG_EXISTS && !SENSOR_MAG_EXT_EXISTS
+	LOG_WRN("Magnetometer node does not exist");
+#endif
+	if (mag_id >= (int)ARRAY_SIZE(dev_mag_names)) {
+		LOG_WRN("Found unknown device");
+	} else if (mag_id < 0) {
+		LOG_WRN("No magnetometer detected");
+	} else {
+		LOG_INF("Found %s", sensor_mag_display_name(mag_id, sensor_mag_dev.addr));
+	}
+	if (mag_id >= 0) // if there is no magnetometer we do not care as much
+	{
+		if (mag_id >= (int)ARRAY_SIZE(sensor_mags) || sensor_mags[mag_id] == NULL
+			|| sensor_mags[mag_id] == &sensor_mag_none) {
+			sensor_mag = &sensor_mag_none;
+			mag_available = false;
+			LOG_ERR("Magnetometer not supported");
+		} else {
+			sensor_mag = sensor_mags[mag_id];
+#if IS_ENABLED(CONFIG_SENSOR_DRV_QMC6309)
+			if (mag_id == MAG_QMC6309) {
+				qmc_set_variant((sensor_mag_dev.addr & 0x7f) == 0x0c);
+			}
+#endif
+			mag_available = true;
+		}
+	} else {
+		sensor_mag = &sensor_mag_none;
+		mag_available = false; // marked as not available
+	}
+#endif
+
+	sensor_scan_write();
+	sensor_imu_id = imu_id;
+#if CONFIG_SENSOR_USE_MAGNETOMETER
+	sensor_mag_id = mag_id;
+
+	mag_enabled = retained->mag_enabled;
+	if (mag_enabled && !mag_available) {
+		LOG_WRN("Magnetometer enabled in settings but no hardware detected");
+	}
+	LOG_INF("Magnetometer: %s (available: %s)", mag_enabled ? "enabled" : "disabled", mag_available ? "yes" : "no");
+#endif
+
+	// Must be called after mag_enabled is set, so get_server_constant_mag_id()
+	// can correctly report SVR_MAG_STATUS_ENABLED / SVR_MAG_STATUS_DISABLED
+	sensor_refresh_sensor_ids();
+
+	sensor_sensor_init = true; // successfully initialized
+	set_sensor_fault(SYS_SENSOR_FAULT_NONE); // clear scan error and its local cause
+	return 0;
+}
+
+static int sensor_request_scan_locked(bool force, bool user_feedback)
+{
+	/* A failed join must never make the scanner's object or stack reusable. */
+	if (sensor_thread_role == SENSOR_THREAD_SCAN) {
+		LOG_ERR("Previous sensor scan has not been joined");
+		return user_feedback ? sensor_operation_result(LED_OWNER_SENSOR, -EBUSY, false) : -EBUSY;
+	}
+	if (sensor_sensor_init && !force) {
+		if (user_feedback) {
+			sensor_operation_result(LED_OWNER_SENSOR, 0, true);
+		}
+		return 0; // already initialized
+	}
+	/* An active or terminal lease must never be undone by a queued scan.
+	 * An ownerless stop is reserved for a failed nonterminal restart. */
+	if (atomic_get(&main_suspended) && sensor_suspend_owner != NULL) {
+		LOG_WRN("Sensor scan rejected while suspended");
+		return user_feedback ? sensor_operation_result(LED_OWNER_SENSOR, -EBUSY, false) : -EBUSY;
+	}
+
+
+	// Protect against forced scan when sensor loop is healthy and actively producing data.
+	//
+	// NOTE: `main_running` only reflects whether the loop is currently inside the processing
+	// section of an iteration. When the loop is waiting for FIFO/interrupt, `main_running`
+	// becomes false even though the loop may be perfectly healthy. Using it here creates a
+	// race where forced scans can still slip through.
+	if (force && !atomic_get(&sensor_recovery_pending) && sensor_sensor_init && main_ok && packet_errors == 0 && !no_packets_timeout_logged && !atomic_get(&main_suspended)) {
+		int64_t now = k_uptime_get();
+		bool allow_force_scan = false;
+
+		// Track forced scan requests to allow override when requested 3 times within 1 minute
+		force_scan_request_times[force_scan_request_count % FORCE_SCAN_THRESHOLD] = now;
+		force_scan_request_count++;
+
+		// Check if we have FORCE_SCAN_THRESHOLD requests within FORCE_SCAN_WINDOW_MS
+		if (force_scan_request_count >= FORCE_SCAN_THRESHOLD) {
+			int64_t oldest_request = force_scan_request_times[force_scan_request_count % FORCE_SCAN_THRESHOLD];
+			int64_t time_window = now - oldest_request;
+
+			if (time_window >= 0 && time_window < FORCE_SCAN_WINDOW_MS) {
+				LOG_INF(
+					"Forced scan allowed: %d requests within %lldms window",
+					FORCE_SCAN_THRESHOLD,
+					(long long)time_window
+				);
+				allow_force_scan = true;
+				// Reset counter after allowing the scan
+				force_scan_request_count = 0;
+				for (int i = 0; i < FORCE_SCAN_THRESHOLD; i++) {
+					force_scan_request_times[i] = 0;
+				}
+			}
+		}
+
+		// If not allowed by multiple requests, check sensor health
+		if (!allow_force_scan) {
+			// If we have produced/sent data recently, treat the loop as healthy and skip.
+			// `last_sensor_send_time` is updated even in resting mode (keepalive), so it's a good
+			// indicator that the loop is alive.
+			int64_t since_last_send = now - last_sensor_send_time;
+			if (since_last_send >= 0 && since_last_send < 1500) {
+				LOG_WRN(
+					"Forced scan requested but sensor loop is healthy (last send %lldms ago), skipping",
+					(long long)since_last_send
+				);
+				if (user_feedback) {
+					sensor_operation_result(LED_OWNER_SENSOR, 0, true);
+				}
+				return 0;
+			}
+		}
+	}
+
+	int suspend_err = main_imu_suspend();
+	if (suspend_err) {
+		LOG_ERR("Sensor scan could not quiesce the sensor: %d", suspend_err);
+		return user_feedback ? sensor_operation_result(LED_OWNER_SENSOR, suspend_err, false) : suspend_err;
+	}
+	struct led_token feedback = led_begin(LED_OWNER_SENSOR, led_request_id());
+	if (user_feedback) {
+		sensor_calibration_result(feedback, LED_ACCEPTED);
+		sensor_calibration_stage(feedback, LED_MAINTENANCE);
+	} else {
+		initialization_feedback = feedback;
+		sensor_calibration_stage(feedback, LED_INITIALIZING);
+	}
+	atomic_clear(&output_ready);
+
+	/* The loop is quiescent. Ask it to exit at the gate and join before
+	 * reusing its thread object and stack; never abort a bus owner. */
+	if (sensor_thread_role == SENSOR_THREAD_LOOP) {
+		atomic_set(&sensor_loop_stop, true);
+		k_sem_give(&sensor_loop_gate);
+		int join_err = k_thread_join(&sensor_thread_id, K_MSEC(SENSOR_ACTIVITY_TIMEOUT_MS));
+		if (join_err) {
+			atomic_clear(&sensor_loop_stop);
+			main_imu_resume();
+			LOG_ERR("Sensor loop did not exit: %d", join_err);
+			if (user_feedback) {
+				sensor_calibration_result(feedback, LED_FAILED);
+			} else {
+				sensor_calibration_stage(initialization_feedback, LED_NONE);
+				initialization_feedback = (struct led_token){0};
+			}
+			return -ETIMEDOUT;
+		}
+		sensor_thread_role = SENSOR_THREAD_NONE;
+		atomic_clear(&sensor_loop_stop);
+		/* The loop owned live fusion and saves it only every few seconds.
+		 * Keep its current state for the loop started after this scan. */
+		sensor_retained_write();
+	}
+	tracker_events_sensor_invalidate(TRACKER_REST_RESET);
+	tracker_events_notify();
+	sensor_life_mark_idle();
+	sensor_suspend_owner = NULL;
+	atomic_clear(&main_suspended);
+	sensor_sensor_init = false;
+	main_ok = false;
+	sensor_imu_id = -1;
+	sensor_refresh_sensor_ids();
+	if (force) {
+		sensor_imu_dev.addr = 0x00;
+#if CONFIG_SENSOR_USE_MAGNETOMETER
+		sensor_mag_dev.addr = 0x00;
+#endif
+		sensor_imu_dev_reg = 0xFF;
+#if CONFIG_SENSOR_USE_MAGNETOMETER
+		sensor_mag_dev_reg = 0xFF;
+#endif
+		LOG_INF("Requested sensor scan");
+	}
+	sensor_thread_role = SENSOR_THREAD_SCAN;
+	k_thread_create(
+		&sensor_thread_id,
+		sensor_thread_id_stack,
+		K_THREAD_STACK_SIZEOF(sensor_thread_id_stack),
+		(k_thread_entry_t)sensor_scan_thread,
+		NULL,
+		NULL,
+		NULL,
+		SENSOR_SCAN_THREAD_PRIORITY,
+		0,
+		K_NO_WAIT
+	);
+	/* The lifecycle lock serializes every join and reuse, including suspend.
+	 * The scan watchdog remains armed if a driver never returns. */
+	int join_err = k_thread_join(&sensor_thread_id, K_FOREVER);
+	if (!join_err) {
+		sensor_thread_role = SENSOR_THREAD_NONE;
+	}
+	if (!join_err && sensor_sensor_init && force) {
+		sensor_thread_role = SENSOR_THREAD_LOOP;
+		k_thread_create(
+			&sensor_thread_id,
+			sensor_thread_id_stack,
+			K_THREAD_STACK_SIZEOF(sensor_thread_id_stack),
+			(k_thread_entry_t)sensor_loop,
+			NULL,
+			NULL,
+			NULL,
+			SENSOR_LOOP_THREAD_PRIORITY,
+			K_FP_REGS,
+			K_NO_WAIT
+		);
+		LOG_INF("Started sensor loop");
+	}
+	int result = join_err ? join_err : (sensor_sensor_init ? 0 : -EIO);
+	if (!result) {
+		atomic_clear(&sensor_recovery_pending);
+		atomic_set(&sensor_progress, 1);
+	}
+	if (user_feedback) {
+		sensor_calibration_result(feedback, result ? LED_FAILED : LED_SUCCESS);
+	} else if (result) {
+		sensor_calibration_stage(initialization_feedback, LED_NONE);
+		initialization_feedback = (struct led_token){0};
+	}
+	return result;
+}
+
+int sensor_request_scan(bool force, bool user_feedback)
+{
+	/* The scanner/loop cannot join or wait for itself. Check before taking
+	 * lifecycle_lock, which another caller may hold while waiting for it. */
+	if (k_current_get() == &sensor_thread_id) {
+		return user_feedback ? sensor_operation_result(LED_OWNER_SENSOR, -EDEADLK, false) : -EDEADLK;
+	}
+	int err = sensor_lifecycle_lock_take();
+	if (err) {
+		LOG_ERR("Sensor scan lifecycle wait timed out");
+		return user_feedback ? sensor_operation_result(LED_OWNER_SENSOR, err, false) : err;
+	}
+	err = sensor_request_scan_locked(force, user_feedback);
+	k_mutex_unlock(&sensor_lifecycle_lock);
+	return err;
+}
+
+static void sensor_scan_read(void) // TODO: move some of this to sys?
+{
+	if (retained->imu_addr != 0) {
+		sensor_imu_dev.addr = retained->imu_addr;
+		sensor_imu_dev_reg = retained->imu_reg;
+	}
+#if CONFIG_SENSOR_USE_MAGNETOMETER
+	if (retained->mag_addr != 0) {
+		sensor_mag_dev.addr = retained->mag_addr;
+		sensor_mag_dev_reg = retained->mag_reg;
+	}
+	// If magnetometer is enabled but address indicates "not found/ignored" (>= 0x7F),
+	// reset to 0 so scan functions perform a full bus search instead of skipping
+	if (retained->mag_enabled && (sensor_mag_dev.addr & 0x7F) >= 0x7F) {
+		LOG_INF("Magnetometer enabled but no valid address, will search");
+		sensor_mag_dev.addr = 0x00;
+		sensor_mag_dev_reg = 0xFF;
+	}
+#endif
+	LOG_INF("IMU address: 0x%02X, register: 0x%02X", sensor_imu_dev.addr, sensor_imu_dev_reg);
+#if CONFIG_SENSOR_USE_MAGNETOMETER
+	LOG_INF("Magnetometer address: 0x%02X, register: 0x%02X", sensor_mag_dev.addr, sensor_mag_dev_reg);
+#endif
+}
+
+static void sensor_scan_write(void) // TODO: move some of this to sys?
+{
+	retained->imu_addr = sensor_imu_dev.addr;
+#if CONFIG_SENSOR_USE_MAGNETOMETER
+	retained->mag_addr = sensor_mag_dev.addr;
+#endif
+	retained->imu_reg = sensor_imu_dev_reg;
+#if CONFIG_SENSOR_USE_MAGNETOMETER
+	retained->mag_reg = sensor_mag_dev_reg;
+#endif
+	retained_update();
+}
+
+static void sensor_scan_clear(void) // TODO: move some of this to sys?
+{
+	retained->imu_addr = 0x00;
+#if CONFIG_SENSOR_USE_MAGNETOMETER
+	retained->mag_addr = 0x00;
+#endif
+	retained->imu_reg = 0xFF;
+#if CONFIG_SENSOR_USE_MAGNETOMETER
+	retained->mag_reg = 0xFF;
+#endif
+	retained_update();
+}
+
+static void sensor_log_retained_state(void)
+{
+#if CONFIG_SENSOR_USE_ACCEL_CALIBRATION
+	LOG_INF("Accelerometer matrix:");
+	for (int i = 0; i < 3; i++) {
+		LOG_INF(
+			"%.5f %.5f %.5f %.5f",
+			(double)retained->accBAinv[0][i],
+			(double)retained->accBAinv[1][i],
+			(double)retained->accBAinv[2][i],
+			(double)retained->accBAinv[3][i]
+		);
+	}
+#endif
+	LOG_INF(
+		"Gyroscope bias: %.5f %.5f %.5f",
+		(double)retained->gyroBias[0],
+		(double)retained->gyroBias[1],
+		(double)retained->gyroBias[2]
+	);
+#if CONFIG_SENSOR_USE_MAGNETOMETER
+	if (mag_available && mag_enabled) {
+		LOG_INF("Magnetometer matrix:");
+		for (int i = 0; i < 3; i++) {
+			LOG_INF(
+				"%.5f %.5f %.5f %.5f",
+				(double)retained->magBAinv[0][i],
+				(double)retained->magBAinv[1][i],
+				(double)retained->magBAinv[2][i],
+				(double)retained->magBAinv[3][i]
+			);
+		}
+	}
+#endif
+	if (retained->fusion_id) {
+		LOG_INF("Fusion data recovered");
+	}
+}
+
+void sensor_retained_write(void) // TODO: move to sys?
+{
+#if CONFIG_SENSOR_USE_TCAL
+	sensor_tcal_lock();
+#endif
+#if CONFIG_SENSOR_USE_MAGNETOMETER
+	k_mutex_lock(&mag_fusion_lock, K_FOREVER);
+#endif
+	if (atomic_get(&fusion_requests) || sensor_calibration_fusion_stale() ||
+	    sensor_calibration_gyro_reference_pending()
+#if CONFIG_SENSOR_USE_MAGNETOMETER
+	    || skip_fusion_save || mag_setting_writes
+#endif
+	) {
+		/* Never save fusion against a baseline not yet consumed by the sensor. */
+		retained->fusion_id = 0;
+	} else if (sensor_fusion_init) {
+		sensor_fusion->save(retained->fusion_data);
+		retained->fusion_id = fusion_id;
+	}
+#if CONFIG_SENSOR_USE_TCAL
+	sensor_tcal_unlock();
+#endif
+	retained_update();
+#if CONFIG_SENSOR_USE_MAGNETOMETER
+	k_mutex_unlock(&mag_fusion_lock);
+#endif
+}
+
+void sensor_record_wom_sleep(void)
+{
+#if CONFIG_DYNAMIC_ACTIVE_TIMEOUT
+	if (sensor_session_woke_from_wom && !sensor_session_meaningful_motion) {
+		if (retained->wom_idle_wake_streak < UINT8_MAX) {
+			retained->wom_idle_wake_streak++;
+		}
+	} else {
+		retained->wom_idle_wake_streak = 0;
+	}
+	retained->wom_sleep_pending = true;
+	retained_update();
+#endif
+}
+
+/* A terminal shutdown stays suspended; only power may continue it. */
+static void sensor_transfer_suspension_to_power(void)
+{
+	k_mutex_lock(&sensor_lifecycle_lock, K_FOREVER);
+	if (sensor_suspend_owner == k_current_get()) {
+		sensor_suspend_owner = power_thread_id;
+	}
+	k_mutex_unlock(&sensor_lifecycle_lock);
+}
+
+int sensor_shutdown(bool *access_quiesced)
+{
+	int err = 0;
+	int imu_err = 0;
+	if (access_quiesced) {
+		*access_quiesced = false;
+	}
+#if CONFIG_SENSOR_TCAL_HEATED
+	bool was_ok = main_ok;
+	main_ok = false;
+	err = sensor_temperature_invalidate();
+	if (err) {
+		main_ok = was_ok;
+		LOG_ERR("Sensor shutdown blocked by heater: %d", err);
+		sensor_transfer_suspension_to_power();
+		return err;
+	}
+#else
+	main_ok = false;
+#endif
+	sensor_calibration_set_consumer_ready(false);
+	/*
+	 * Do not rescan here: during OTA / power-off the bus or sensor clock may
+	 * already be unavailable. Shutdown only talks to drivers already bound.
+	 */
+#if CONFIG_SENSOR_USE_MAGNETOMETER
+	sensor_mag_timing_reset();
+#endif
+	if (!sensor_sensor_init || sensor_imu == NULL || sensor_imu == &sensor_imu_none) {
+		LOG_INF("sensor_shutdown: sensors not initialized, skip driver shutdown");
+	} else {
+		err = sys_interface_resume();
+		if (!err) {
+#if CONFIG_SENSOR_USE_MAGNETOMETER
+			if (mag_available && mag_enabled && sensor_mag != NULL && sensor_mag != &sensor_mag_none) {
+				sensor_mag->shutdown();
+			}
+#endif
+			imu_err = sensor_imu->shutdown();
+			if (imu_err) {
+				LOG_ERR("IMU shutdown failed: %d", imu_err);
+			}
+		}
+	}
+	/* A failed resume may have resumed only some buses. Always try to
+	 * suspend all of them, and prioritize host-side PM errors at the owner. */
+	int suspend_err = sys_interface_suspend();
+	if (!err) {
+		err = suspend_err;
+	}
+	if (!err && access_quiesced) {
+		*access_quiesced = true;
+	}
+	/* The shutdown owner is done touching drivers. Keep the stop latched and
+	 * transfer it only to the power thread, never to calibration or scans. */
+	sensor_transfer_suspension_to_power();
+	return err ? err : imu_err;
+}
+
+int sensor_setup_WOM(void)
+{
+	/* The power thread retains the shutdown lease through WOM setup. */
+	int err = main_imu_suspend();
+	if (err) {
+		return err;
+	}
+	err = sensor_request_scan(false, false);
+	if (err) {
+		return err;
+	}
+	err = sys_interface_resume();
+	if (err) {
+		return err;
+	}
+	int pin_config = sensor_imu->setup_WOM();
+	err = sys_interface_suspend();
+	if (err) {
+		return err;
+	}
+	return pin_config == 0xFF ? -EIO : pin_config;
+}
+
+#if CONFIG_SENSOR_USE_MAGNETOMETER
+/* A failed nonterminal restart remains stopped but can be retried safely. */
+static void sensor_release_failed_restart(void)
+{
+	k_mutex_lock(&sensor_lifecycle_lock, K_FOREVER);
+	if (sensor_suspend_owner == k_current_get()) {
+		sensor_suspend_owner = NULL;
+	}
+	k_mutex_unlock(&sensor_lifecycle_lock);
+}
+
+static bool sensor_mag_uses_i2c_passthrough(void)
+{
+	return (sensor_mag_dev.addr & 0x80) && !(sensor_imu_dev_reg & 0x80);
+}
+
+static int sensor_mag_runtime_enable(void)
+{
+	sensor_mag_timing_reset();
+	float mag_initial_time = 1.0f / CONFIG_SENSOR_MAG_ODR;
+
+	if (sensor_mag_uses_i2c_passthrough()) {
+		int mode_err = sensor_imu->ext_setup(SENSOR_EXT_MODE_I2C_PASSTHROUGH);
+		if (mode_err) {
+			return mode_err;
+		}
+	}
+	int err = sensor_mag->init(mag_initial_time, &mag_actual_time);
+	if (err < 0) {
+		LOG_ERR("Magnetometer init failed: %d", err);
+		if (sensor_mag_uses_i2c_passthrough()) {
+			sensor_imu->ext_setup(SENSOR_EXT_MODE_OFF);
+		}
+		return err;
+	}
+	sensor_mag_timing_configure();
+	LOG_INF("Magnetometer rate: %.2fHz", 1.0 / (double)mag_actual_time);
+	return 0;
+}
+
+static void sensor_mag_runtime_disable(void)
+{
+	sensor_mag_timing_reset();
+	if (sensor_mag == NULL || sensor_mag == &sensor_mag_none) {
+		return;
+	}
+	if (sensor_mag_uses_i2c_passthrough()) {
+		sensor_imu->ext_setup(SENSOR_EXT_MODE_I2C_PASSTHROUGH);
+	}
+	sensor_mag->shutdown();
+	if (sensor_mag_uses_i2c_passthrough()) {
+		sensor_imu->ext_setup(SENSOR_EXT_MODE_OFF);
+	}
+	mag_calibrated = false;
+}
+
+static void sensor_invalidate_mag_fusion(bool setting_write)
+{
+	k_mutex_lock(&mag_fusion_lock, K_FOREVER);
+	if (setting_write) {
+		mag_setting_writes++;
+	}
+	skip_fusion_save = true;
+	mag_fusion_restarted = false;
+	atomic_clear(&mag_fusion_finish_pending);
+	retained->fusion_id = 0;
+	retained_update();
+	k_mutex_unlock(&mag_fusion_lock);
+}
+
+int sensor_set_mag_enabled(bool enabled)
+{
+	if ((sensor_sensor_init && main_ok ? mag_enabled : retained->mag_enabled) == enabled) {
+		LOG_INF("Magnetometer already %s", enabled ? "enabled" : "disabled");
+		int storage_err = atomic_get(&mag_persistence_error);
+		if (enabled && (!mag_available || !main_ok || !sensor_sensor_init || main_suspended)) {
+			led_request_event(LED_OWNER_MAG, led_request_id(), led_event_id(), LED_PARTIAL);
+			return storage_err;
+		}
+		return sensor_operation_result(LED_OWNER_MAG, storage_err, true);
+	}
+
+	if (magneto_progress & 0x80) {
+		LOG_WRN("Magnetometer toggle blocked: mag calibration in progress");
+		return sensor_operation_result(LED_OWNER_MAG, -EBUSY, false);
+	}
+
+	if (!sensor_sensor_init || !main_ok) {
+		LOG_INF("%s magnetometer, rebooting (sensor not ready)...", enabled ? "Enabling" : "Disabling");
+		sensor_invalidate_mag_fusion(true);
+		bool val = enabled;
+		int storage_err = sys_write(MAG_ENABLED_ID, &retained->mag_enabled, &val, sizeof(val));
+		k_mutex_lock(&mag_fusion_lock, K_FOREVER);
+		mag_setting_writes--;
+		if (!mag_setting_writes && skip_fusion_save && mag_fusion_restarted &&
+		    mag_enabled == retained->mag_enabled) {
+			atomic_set(&mag_fusion_finish_pending, 1);
+		}
+		k_mutex_unlock(&mag_fusion_lock);
+		atomic_set(&mag_persistence_error, storage_err);
+		int reboot_err = sys_request_system_reboot();
+		int result = storage_err < 0 ? storage_err : reboot_err;
+		/* Durable intent is not proof that the missing live consumer applied it. */
+		led_request_event(LED_OWNER_MAG, led_request_id(), led_event_id(),
+			result < 0 ? LED_PARTIAL : LED_ACCEPTED);
+		return result;
+	}
+
+
+	LOG_INF("%s magnetometer (runtime)...", enabled ? "Enabling" : "Disabling");
+	int suspend_err = main_imu_suspend();
+	if (suspend_err) {
+		LOG_ERR("Magnetometer change could not quiesce the sensor: %d", suspend_err);
+		return sensor_operation_result(LED_OWNER_MAG, suspend_err, false);
+	}
+	int err = 0;
+	int pm_err = 0;
+	if (mag_available) {
+		err = sys_interface_resume();
+		if (err) {
+			main_imu_resume();
+			return sensor_operation_result(LED_OWNER_MAG, err, false);
+		}
+	}
+	if (mag_available) {
+		if (enabled) {
+			err = sensor_mag_runtime_enable();
+		} else {
+			sensor_mag_runtime_disable();
+		}
+		pm_err = sys_interface_suspend();
+		if (pm_err < 0) {
+			LOG_ERR("Magnetometer interface suspension failed: %d", pm_err);
+		}
+	}
+
+	if (err < 0) {
+		LOG_ERR("Magnetometer enable failed; leaving disabled");
+		main_imu_resume();
+		return sensor_operation_result(LED_OWNER_MAG, err, false);
+	}
+	sensor_invalidate_mag_fusion(false);
+
+	bool val = enabled;
+	int storage_err = sys_write(MAG_ENABLED_ID, &retained->mag_enabled, &val, sizeof(val));
+	atomic_set(&mag_persistence_error, storage_err);
+	mag_enabled = enabled;
+
+	int restart_err = main_imu_restart();
+	if (restart_err) {
+		LOG_ERR("Fusion restart failed; sensor left suspended: %d", restart_err);
+		sensor_release_failed_restart();
+		led_request_event(LED_OWNER_MAG, led_request_id(), led_event_id(), LED_PARTIAL);
+		return restart_err;
+	}
+	sensor_refresh_sensor_ids();
+
+#if CONFIG_CONNECTION_RAW_COLLECTION
+	if (connection_get_data_collection() || connection_get_data_collection_batch()) {
+		sensor_send_raw_metadata();
+	}
+#endif
+
+	main_imu_resume();
+	if (pm_err < 0) {
+		led_request_event(LED_OWNER_MAG, led_request_id(), led_event_id(), LED_PARTIAL);
+		return pm_err;
+	}
+	if (enabled && !mag_available) {
+		led_request_event(LED_OWNER_MAG, led_request_id(), led_event_id(),
+			storage_err < 0 ? LED_APPLIED_NOT_SAVED : LED_PARTIAL);
+		return storage_err;
+	}
+	LOG_INF("Magnetometer %s", enabled ? "enabled" : "disabled");
+	return sensor_operation_result(LED_OWNER_MAG, storage_err, true);
+}
+#endif
+
+bool sensor_get_mag_enabled(void)
+{
+#if CONFIG_SENSOR_USE_MAGNETOMETER
+	return mag_enabled;
+#else
+	return false;
+#endif
+}
+
+bool sensor_get_mag_available(void)
+{
+#if CONFIG_SENSOR_USE_MAGNETOMETER
+	return mag_available;
+#else
+	return false;
+#endif
+}
+
+bool sensor_get_mag_calibrated(void)
+{
+#if CONFIG_SENSOR_USE_MAGNETOMETER
+	return mag_calibrated;
+#else
+	return false;
+#endif
+}
+
+void sensor_refresh_sensor_ids(void)
+{
+#if CONFIG_SENSOR_USE_MAGNETOMETER
+	connection_update_sensor_ids(sensor_imu_id, sensor_mag_id);
+#else
+	connection_update_sensor_ids(sensor_imu_id, -1);
+#endif
+}
+
+int sensor_request_fusion_reset(bool user_feedback)
+{
+	if (user_feedback && (!main_ok || !sensor_fusion_init || atomic_get(&main_suspended))) {
+		return sensor_operation_result(LED_OWNER_SENSOR, -EAGAIN, false);
+	}
+	k_spinlock_key_t key = k_spin_lock(&fusion_feedback_lock);
+	if (user_feedback && !fusion_feedback.session) {
+		fusion_feedback = led_begin(LED_OWNER_SENSOR, led_request_id());
+		sensor_calibration_result(fusion_feedback, LED_ACCEPTED);
+		sensor_calibration_stage(fusion_feedback, LED_MAINTENANCE);
+	}
+	atomic_or(&fusion_requests, FUSION_REQUEST_RESET);
+	k_spin_unlock(&fusion_feedback_lock, key);
+	return 0;
+}
+
+static void sensor_discard_gyro_window(void)
+{
+#if CONFIG_SENSOR_GYRO_OVERSAMPLING > 1
+	gyro_oversample_count = 0;
+	gyro_dq_acc[0] = 1.0f;
+	gyro_dq_acc[1] = gyro_dq_acc[2] = gyro_dq_acc[3] = 0.0f;
+	memset(gyro_merge_bias_dps, 0, sizeof(gyro_merge_bias_dps));
+#endif
+}
+
+static void sensor_discard_partial_samples(void)
+{
+	sensor_discard_gyro_window();
+#if CONFIG_SENSOR_ACCEL_OVERSAMPLING > 1
+	accel_oversample_count = 0;
+	memset(accel_oversample_sum, 0, sizeof(accel_oversample_sum));
+#endif
+}
+
+/* Only the sensor thread mutates live fusion. Never wait for this thread from
+ * calibration: BMI retrim, power and rescan can have it suspended. */
+static void sensor_apply_calibration_frame(void)
+{
+#if CONFIG_SENSOR_USE_MAGNETOMETER
+	sensor_service_pending_mag_fusion();
+	magneto_online_apply_pending();
+#endif
+	enum sensor_calibration_effect effect = sensor_calibration_apply_pending();
+	k_spinlock_key_t key = k_spin_lock(&fusion_feedback_lock);
+	atomic_val_t requests = atomic_set(&fusion_requests, 0);
+	struct led_token feedback = fusion_feedback;
+	k_spin_unlock(&fusion_feedback_lock, key);
+	if (effect == SENSOR_CALIBRATION_SAVE_FUSION && !requests) {
+		sensor_retained_write();
+		return;
+	}
+	bool reset = (requests & FUSION_REQUEST_RESET) || effect == SENSOR_CALIBRATION_FRAME_CHANGED;
+	if (!requests && effect == SENSOR_CALIBRATION_UNCHANGED && !reset) {
+		return;
+	}
+	sensor_discard_partial_samples();
+	if (reset) {
+		int err = main_imu_restart();
+		if (err) {
+			atomic_or(&fusion_requests, requests | FUSION_REQUEST_RESET);
+			LOG_ERR("Fusion reset deferred by heater shutdown: %d", err);
+			return;
+		}
+	}
+	if (reset || effect == SENSOR_CALIBRATION_BIAS_CHANGED) {
+		sensor_calibration_reset_gyro_reference();
+		if (sensor_fusion_init) {
+			float zero[3] = {0};
+			sensor_fusion->set_gyro_bias(zero);
+		}
+	}
+	sensor_calibration_fusion_applied();
+	sensor_retained_write();
+	if (requests & FUSION_REQUEST_RESET) {
+		key = k_spin_lock(&fusion_feedback_lock);
+		if (feedback.session == fusion_feedback.session) {
+			sensor_calibration_result(feedback, LED_SUCCESS);
+			fusion_feedback = (struct led_token){0};
+		}
+		k_spin_unlock(&fusion_feedback_lock, key);
+	}
+}
+
+static void set_update_time_ms(int time_ms)
+{
+#if IMU_INT_EXISTS
+	float fifo_threshold = (float)time_ms / 1000.0f / sensor_actual_time; // target loop rate
+	sensor_fifo_threshold = MAX(1, (int16_t)fifo_threshold);
+	uint16_t setup_threshold = sensor_fifo_setup_threshold();
+	LOG_INF(
+		"FIFO THS/WM/WTM: %.2f -> %d%s",
+		(double)fifo_threshold,
+		sensor_fifo_threshold,
+		setup_threshold != sensor_fifo_threshold ? " (startup 1)" : ""
+	);
+	sensor_imu->setup_DRDY(setup_threshold); // do not need to reset pin config
+#endif
+	sensor_update_time_ms = time_ms; // TODO: terrible naming
+}
+
+/* FIFO watermark INT wakeup. A counting semaphore cannot lose a wakeup
+ * between the "check flag" and "k_msleep" window in sensor_loop_wait(),
+ * unlike the previous plain flag. */
+static K_SEM_DEFINE(sensor_int_sem, 0, 1);
+static uint32_t sensor_int_timeouts;
+
+/* Per-5s loop/pipeline diagnostics (reported at DBG). */
+static uint32_t sensor_window_iters;
+static uint32_t sensor_window_publishes;
+static float sensor_window_fused_angle_rad;
+static uint64_t sensor_window_proc_us;
+static uint64_t sensor_window_wait_us;
+static uint64_t sensor_window_packets;
+static uint64_t sensor_window_acq_us;
+static uint64_t sensor_window_vqf_us;
+static uint32_t sensor_window_ints;
+static uint64_t sensor_window_acq_max_us;
+static uint64_t sensor_window_proc_max_us;
+static uint64_t sensor_window_resume_max_us;
+static uint64_t sensor_window_fifo_max_us;
+static int64_t sensor_startup_discard_until_ms;
+static bool sensor_startup_discard_logged;
+
+static void sensor_interrupt_handler(const struct device *dev, struct gpio_callback *cb, uint32_t pins)
+{
+	sensor_window_ints++;
+	k_sem_give(&sensor_int_sem);
+}
+
+static struct gpio_callback sensor_cb_data;
+
+enum sensor_sensor_mode {
+	//	SENSOR_SENSOR_MODE_OFF,
+	SENSOR_SENSOR_MODE_LOW_NOISE,
+	SENSOR_SENSOR_MODE_LOW_POWER,
+	SENSOR_SENSOR_MODE_LOW_POWER_2
+};
+
+static enum sensor_sensor_mode sensor_mode = SENSOR_SENSOR_MODE_LOW_NOISE;
+static enum sensor_sensor_mode last_sensor_mode = SENSOR_SENSOR_MODE_LOW_NOISE;
+
+enum sensor_sensor_timeout {
+	SENSOR_SENSOR_TIMEOUT_IMU,
+	SENSOR_SENSOR_TIMEOUT_IMU_ELAPSED,
+	SENSOR_SENSOR_TIMEOUT_ACTIVITY,
+	SENSOR_SENSOR_TIMEOUT_ACTIVITY_ELAPSED,
+};
+
+static enum sensor_sensor_timeout sensor_timeout = SENSOR_SENSOR_TIMEOUT_IMU;
+static bool was_ota_suppressed = false;
+
+#if CONFIG_USE_ACTIVE_TIMEOUT && CONFIG_SLEEP_ON_ACTIVE_TIMEOUT && CONFIG_USE_IMU_WAKE_UP
+static bool sensor_uses_normal_timeout(void)
+{
+#if CONFIG_DYNAMIC_ACTIVE_TIMEOUT
+	return !sensor_session_woke_from_wom || sensor_session_meaningful_motion;
+#else
+	return true;
+#endif
+}
+#endif
+
+static int64_t sensor_get_active_timeout_delay(void)
+{
+#if CONFIG_DYNAMIC_ACTIVE_TIMEOUT
+	if (sensor_session_woke_from_wom && !sensor_session_meaningful_motion) {
+		if (retained->wom_idle_wake_streak >= CONFIG_ACTIVE_TIMEOUT_REPEAT_WAKE_COUNT) {
+			return CONFIG_ACTIVE_TIMEOUT_REPEAT_WAKE_DELAY;
+		}
+		return CONFIG_ACTIVE_TIMEOUT_IDLE_WAKE_DELAY;
+	}
+#endif
+	return wom_timeout_get_delay_ms();
+}
+
+static void sensor_update_session_motion(float angular_speed_dps, float lin_accel, int64_t now_ms)
+{
+#if CONFIG_DYNAMIC_ACTIVE_TIMEOUT
+	if (sensor_session_woke_from_wom && !sensor_session_meaningful_motion) {
+		if (sensor_activity_score_update(
+				&sensor_session_activity_score,
+				angular_speed_dps,
+				lin_accel,
+				now_ms,
+				SENSOR_ACTIVITY_STARTUP_GUARD_MS,
+				CONFIG_ACTIVE_TIMEOUT_MEANINGFUL_MOTION_MS
+			)) {
+			sensor_session_meaningful_motion = true;
+			retained->wom_idle_wake_streak = 0;
+			retained_update();
+			LOG_INF("Meaningful activity restored normal sleep timeout");
+		}
+	}
+#endif
+}
+
+// TODO: consider automatic sleep and shutdown policy when the IMU is in an error state.
+static void sensor_update_sensor_state(bool resting)
+{
+	bool calibrating = get_status(SYS_STATUS_CALIBRATION_RUNNING);
+#if CONFIG_SENSOR_USE_TCAL
+	calibrating = calibrating || sensor_tcal_get_auto_calibration();
+#endif
+#if CONFIG_SENSOR_TCAL_HEATED
+	calibrating = calibrating || sensor_tcal_heated_busy();
+#endif
+	bool in_test_mode = test_mode_get();
+	bool ota_suppressed_now = esb_ota_is_active() || connection_get_ota_suppressed();
+	bool suspended = atomic_get(&main_suspended);
+	int64_t now_ms = k_uptime_get();
+	/* Exclude a setting commit between reading its delay and publishing the
+	 * corresponding plan. Calibration queries above never hold this gate. */
+	sys_power_policy_lock();
+
+	/* Reset activity timer on OTA suppression→unsuppression transition
+	 * to prevent accumulated idle time from immediately triggering sleep
+	 * when suppression lifts between OTA batches. */
+	if (was_ota_suppressed && !ota_suppressed_now) {
+		last_data_time = now_ms;
+	}
+	was_ota_suppressed = ota_suppressed_now;
+	/* Manual entry ignores idle/rest policy, including automatic shutdown,
+	 * but the power owner still rechecks every safety veto before sleeping. */
+	if (sys_WOM_manual_pending()) {
+		sys_power_policy_unlock();
+		return;
+	}
+
+	if (!in_test_mode && !calibrating && !ota_suppressed_now && !suspended && resting) {
+		int64_t last_data_delta = now_ms - last_data_time;
+		bool wom_eligible = false;
+		if (sensor_mode < SENSOR_SENSOR_MODE_LOW_POWER
+			&& last_data_delta > CONFIG_SENSOR_LP_TIMEOUT) // No motion in lp timeout
+		{
+			LOG_INF("No motion from sensors in %dms", CONFIG_SENSOR_LP_TIMEOUT);
+			sensor_mode = SENSOR_SENSOR_MODE_LOW_POWER;
+		}
+#if CONFIG_SENSOR_USE_LOW_POWER_2 || CONFIG_USE_IMU_TIMEOUT
+		int64_t imu_timeout = CLAMP(
+			last_data_time - last_suspend_attempt_time,
+			CONFIG_IMU_TIMEOUT_RAMP_MIN,
+			CONFIG_IMU_TIMEOUT_RAMP_MAX
+		); // Ramp timeout from last_data_time
+#endif
+#if CONFIG_SENSOR_USE_LOW_POWER_2
+		if (sensor_mode < SENSOR_SENSOR_MODE_LOW_POWER_2 && last_data_delta > imu_timeout) { // No motion in ramp time
+			sensor_mode = SENSOR_SENSOR_MODE_LOW_POWER_2;
+		}
+#endif
+#if CONFIG_USE_ACTIVE_TIMEOUT
+		if (sensor_timeout < SENSOR_SENSOR_TIMEOUT_ACTIVITY
+			&& last_data_delta > CONFIG_ACTIVE_TIMEOUT_THRESHOLD) // higher priority than IMU timeout
+		{
+			LOG_INF("Switching to activity timeout (%llds)", sensor_get_active_timeout_delay() / 1000);
+			sensor_timeout = SENSOR_SENSOR_TIMEOUT_ACTIVITY;
+		}
+		int64_t active_timeout_delay = sensor_get_active_timeout_delay();
+#if CONFIG_SLEEP_ON_ACTIVE_TIMEOUT && CONFIG_USE_IMU_WAKE_UP
+		if (sensor_timeout >= SENSOR_SENSOR_TIMEOUT_ACTIVITY &&
+		    last_data_delta >= MAX(0, active_timeout_delay - TRACKER_EVENT_WOM_ADVANCE_MS)) {
+			wom_eligible = true;
+			if (sys_plan_WOM(true, last_data_time + active_timeout_delay,
+					 sensor_uses_normal_timeout()) == 0 &&
+			    last_data_delta > active_timeout_delay) {
+				sensor_timeout = SENSOR_SENSOR_TIMEOUT_ACTIVITY_ELAPSED;
+			}
+		}
+#elif CONFIG_SHUTDOWN_ON_ACTIVE_TIMEOUT && CONFIG_USER_SHUTDOWN
+		if (sensor_timeout == SENSOR_SENSOR_TIMEOUT_ACTIVITY && last_data_delta > active_timeout_delay) {
+			if (sys_request_system_off() == 0) {
+				sensor_timeout = SENSOR_SENSOR_TIMEOUT_ACTIVITY_ELAPSED;
+			}
+		}
+#endif
+#endif /* CONFIG_USE_ACTIVE_TIMEOUT */
+#if CONFIG_USE_IMU_TIMEOUT && CONFIG_USE_IMU_WAKE_UP
+		if (sensor_timeout <= SENSOR_SENSOR_TIMEOUT_IMU_ELAPSED &&
+		    last_data_delta >= MAX(0, imu_timeout - TRACKER_EVENT_WOM_ADVANCE_MS)) {
+			wom_eligible = true;
+			/* Announcing early is not a suspend attempt. Preserve the original
+			 * ramp anchor only once the original idle threshold is due and
+			 * its request has been accepted. */
+			if (sys_plan_WOM(false, last_data_time + imu_timeout, false) == 0 &&
+			    last_data_delta > imu_timeout) {
+				sensor_timeout = SENSOR_SENSOR_TIMEOUT_IMU_ELAPSED;
+			}
+		}
+#endif
+		if (!wom_eligible) {
+			sys_cancel_WOM();
+		}
+	} else {
+		sys_cancel_WOM();
+		if (sensor_mode == SENSOR_SENSOR_MODE_LOW_POWER_2 ||
+		    sensor_timeout == SENSOR_SENSOR_TIMEOUT_IMU_ELAPSED) {
+			last_suspend_attempt_time = k_uptime_get();
+		}
+		// last_data_time now updated when sending data to improve responsiveness
+		if (sensor_timeout == SENSOR_SENSOR_TIMEOUT_IMU_ELAPSED ||
+		    sensor_timeout == SENSOR_SENSOR_TIMEOUT_ACTIVITY_ELAPSED) {
+			sensor_timeout = SENSOR_SENSOR_TIMEOUT_IMU;
+		}
+		sensor_mode = SENSOR_SENSOR_MODE_LOW_NOISE;
+	}
+	sys_power_policy_unlock();
+}
+
+static int sensor_init(void)
+{
+	sys_cancel_WOM();
+	tracker_events_sensor_invalidate(TRACKER_REST_INITIALIZING);
+	tracker_events_notify();
+	int err;
+#if CONFIG_SENSOR_USE_MAGNETOMETER
+	sensor_mag_timing_reset();
+#endif
+	sensor_diagnostics_reset_frame();
+	sensor_update_frame_transform_cache();
+	// TODO: on any errors set main_ok false and skip (make functions return nonzero)
+#if CONFIG_SENSOR_USE_MAGNETOMETER
+	if (mag_available && mag_enabled) // shutdown magnetometer first only when enabled
+	{
+		if (sensor_mag_uses_i2c_passthrough()) {
+			sensor_imu->ext_setup(SENSOR_EXT_MODE_I2C_PASSTHROUGH);
+		}
+		sensor_mag->shutdown(); // TODO: is this needed?
+	}
+#endif
+	bool fast_wom_wake = sensor_wom_fast_wake_resume_pending && sensor_imu_fast_wom_wake_supported();
+	sensor_wom_fast_wake_resume_pending = false;
+	if (fast_wom_wake) {
+		LOG_INF("Skipping IMU pre-init reset after WOM wake");
+	} else {
+		err = sensor_imu->shutdown();
+		if (err) {
+			LOG_ERR("IMU pre-init reset failed: %d", err);
+			return err;
+		}
+	}
+
+	// Clock already enabled during sensor scan, just ensure it's still on
+	float clock_actual_rate = 0;
+	set_sensor_clock(true, 32768, &clock_actual_rate); // ensure clock source is still enabled
+
+	// wait for sensor register reset // TODO: is this needed?
+	k_usleep(250);
+
+	// set FS/range
+	float accel_range = CONFIG_SENSOR_ACCEL_FS;
+	float gyro_range = CONFIG_SENSOR_GYRO_FS;
+	sensor_imu->update_fs(accel_range, gyro_range, &accel_actual_range, &gyro_actual_range);
+	LOG_INF("Accelerometer range: %.2fg", (double)accel_actual_range);
+	LOG_INF("Gyroscope range: %.2fdps", (double)gyro_actual_range);
+
+	// setup sensor, set ODR
+	float accel_initial_time = 1.0f / CONFIG_SENSOR_ACCEL_ODR; // configure with accel ODR from config
+#if CONFIG_SENSOR_USE_MAGNETOMETER
+	float mag_initial_time = 1.0f / CONFIG_SENSOR_MAG_ODR;
+#endif
+	/*
+	 * Gyro request: SPI keeps CONFIG ODR + INT_merge N.
+	 * I2C: bus cannot drain hi-res FIFO at high ODR — drop merge, request
+	 * the intended fusion rate (ODR/N) so chip Hz ≈ fusion Hz.
+	 */
+	gyro_oversample_n = CONFIG_SENSOR_GYRO_OVERSAMPLING;
+	float gyro_request_hz = (float)CONFIG_SENSOR_GYRO_ODR;
+	if (sensor_interface_imu_is_i2c() && CONFIG_SENSOR_GYRO_OVERSAMPLING > 1) {
+		gyro_oversample_n = 1;
+		gyro_request_hz = (float)CONFIG_SENSOR_GYRO_ODR / (float)CONFIG_SENSOR_GYRO_OVERSAMPLING;
+		LOG_INF(
+			"I2C IMU: gyro request %.0fHz (fusion target), oversampling off (config %dx @ %dHz)",
+			(double)gyro_request_hz,
+			CONFIG_SENSOR_GYRO_OVERSAMPLING,
+			CONFIG_SENSOR_GYRO_ODR
+		);
+	}
+	float gyro_initial_time = 1.0f / gyro_request_hz;
+	err = sensor_imu
+			  ->init(clock_actual_rate, accel_initial_time, gyro_initial_time, &accel_actual_time, &gyro_actual_time);
+	sensor_actual_time = MIN(accel_actual_time, gyro_actual_time);
+#if SENSOR_IMU_SPI_EXISTS
+	LOG_INF("Requested SPI frequency: %.2fMHz", (double)sensor_imu_spi_dev.config.frequency / 1000000.0);
+#endif
+	LOG_INF("Accelerometer initial rate: %.2fHz", 1.0 / (double)accel_actual_time);
+	LOG_INF("Gyrometer initial rate: %.2fHz", 1.0 / (double)gyro_actual_time);
+	if (err < 0) {
+		return err;
+	}
+	// 55-66ms to wait, get chip ids, and setup icm (50ms spent waiting for accel and gyro to start)
+#if CONFIG_SENSOR_USE_MAGNETOMETER
+	if (mag_available && mag_enabled) {
+		// Proxy mode is restored by the IMU init; passthrough must be explicit.
+		if (sensor_mag_uses_i2c_passthrough()) {
+			sensor_imu->ext_setup(SENSOR_EXT_MODE_I2C_PASSTHROUGH);
+		}
+		err = sensor_mag->init(mag_initial_time, &mag_actual_time); // configure with ~200Hz ODR
+#if SENSOR_MAG_SPI_EXISTS
+		LOG_INF("Requested SPI frequency: %.2fMHz", (double)sensor_mag_spi_dev.config.frequency / 1000000.0);
+#endif
+		LOG_INF("Magnetometer initial rate: %.2fHz", 1.0 / (double)mag_actual_time);
+		if (err < 0) {
+			return err;
+		}
+		sensor_mag_timing_configure();
+		// 0-1ms to setup mmc
+	}
+#endif
+	LOG_INF("Initialized sensors");
+
+#if CONFIG_SENSOR_GYRO_OVERSAMPLING > 1
+	gyro_dq_acc[0] = 1.0f;
+	gyro_dq_acc[1] = 0.0f;
+	gyro_dq_acc[2] = 0.0f;
+	gyro_dq_acc[3] = 0.0f;
+	gyro_oversample_count = 0;
+	gyro_merge_bias_dps[0] = gyro_merge_bias_dps[1] = gyro_merge_bias_dps[2] = 0.0f;
+	gyro_effective_time = gyro_actual_time * (float)gyro_oversample_n;
+	if (gyro_oversample_n > 1) {
+		LOG_INF(
+			"Gyro INT_merge: %dx Δq @ %.2fHz → fusion %.2fHz (firmware cal per sample; fusion bias frozen/window)",
+			gyro_oversample_n,
+			1.0 / (double)gyro_actual_time,
+			1.0 / (double)gyro_effective_time
+		);
+	}
+#endif
+
+#if CONFIG_SENSOR_ACCEL_OVERSAMPLING > 1
+	// Initialize accel oversampling state
+	accel_oversample_count = 0;
+	for (int i = 0; i < 3; i++) {
+		accel_oversample_sum[i] = 0;
+	}
+	// Calculate effective time step for fusion after oversampling
+	accel_effective_time = accel_actual_time * CONFIG_SENSOR_ACCEL_OVERSAMPLING;
+	LOG_INF(
+		"Accel oversampling: %dx, effective rate: %.2fHz",
+		CONFIG_SENSOR_ACCEL_OVERSAMPLING,
+		1.0 / (double)accel_effective_time
+	);
+#endif
+
+	// Setup fusion
+	sensor_log_retained_state();
+#if CONFIG_SENSOR_USE_VQF
+	if (fusion_id == FUSION_VQF) {
+		vqf_update_sensor_ids(sensor_imu_id);
+	}
+#endif
+	struct fusion_periods periods = sensor_fusion_periods();
+	if (retained->fusion_id == fusion_id) // Check if the retained fusion data is valid and matches the selected fusion
+	{                                     // Load state if the data is valid (fusion was initialized before)
+		sensor_fusion->load(retained->fusion_data, periods.gyro, periods.accel, periods.mag);
+#if CONFIG_SENSOR_USE_MAGNETOMETER
+		/* Retained fusion may describe an unconfirmed trial matrix from before
+		 * sleep. Reacquire only its magnetic domain against confirmed storage. */
+		sensor_fusion_reset_mag_ref();
+#endif
+		retained->fusion_id = 0; // Invalidate retained fusion data
+		retained_update();
+	} else {
+		sensor_fusion->init(periods.gyro, periods.accel, periods.mag);
+	}
+
+#if IMU_INT_EXISTS
+	// Setup interrupt
+	float fifo_threshold = sensor_update_time_ms / 1000.0f / sensor_actual_time; // target loop rate
+	sensor_fifo_threshold = MAX(1, (int16_t)fifo_threshold);
+	sensor_fast_first_update_pending = true;
+	uint16_t setup_threshold = sensor_fifo_setup_threshold();
+	LOG_INF(
+		"FIFO THS/WM/WTM: %.2f -> %d%s",
+		(double)fifo_threshold,
+		sensor_fifo_threshold,
+		setup_threshold != sensor_fifo_threshold ? " (startup 1)" : ""
+	);
+	uint8_t pin_config = sensor_imu->setup_DRDY(setup_threshold);
+	if (pin_config == 0) {
+		return -1;
+	}
+	{
+		uint32_t int0_abs = NRF_DT_GPIOS_TO_PSEL(ZEPHYR_USER_NODE, int0_gpios);
+
+		LOG_INF("FIFO THS/WM/WTM GPIO " NRF_ABS_PIN_LOG_FMT ", config: %u", NRF_ABS_PIN_LOG_ARGS(int0_abs), pin_config);
+	}
+	uint32_t pull_flags = ((pin_config >> 4) == NRF_GPIO_PIN_PULLDOWN ? GPIO_PULL_DOWN : 0)
+						| ((pin_config >> 4) == NRF_GPIO_PIN_PULLUP ? GPIO_PULL_UP : 0);
+	gpio_pin_configure_dt(&int0, GPIO_INPUT | pull_flags);
+	uint32_t int_flags = ((pin_config & 0xF) == NRF_GPIO_PIN_SENSE_LOW ? GPIO_INT_EDGE_FALLING : 0)
+					   | ((pin_config & 0xF) == NRF_GPIO_PIN_SENSE_HIGH ? GPIO_INT_EDGE_RISING : 0);
+	gpio_pin_interrupt_configure_dt(&int0, int_flags);
+	gpio_init_callback(&sensor_cb_data, sensor_interrupt_handler, BIT(int0.pin));
+	gpio_add_callback(int0.port, &sensor_cb_data);
+#else
+	LOG_WRN("IMU FIFO THS/WM/WTM GPIO does not exist");
+	LOG_WRN("IMU FIFO THS/WM/WTM not available");
+#endif
+
+	LOG_INF("Using %s", fusion_names[fusion_id]);
+	LOG_INF("Initialized fusion");
+	sensor_fusion_init = true;
+	sensor_calibration_reset_gyro_reference();
+#if CONFIG_SENSOR_USE_MAGNETOMETER
+	sensor_mag_timing_reset();
+	sensor_finish_mag_fusion_restart(true);
+#endif
+
+
+	return 0;
+}
+
+#define ACQUISITION_START_MS 1000
+#define STATUS_INTERVAL_MS 5000
+
+static int64_t last_status_time = 0;
+static int64_t max_loop_time = 0;
+static float processing_work_time_ema_ms; /* elapsed processing work before the loop wait */
+
+
+#if CONFIG_CONNECTION_RAW_COLLECTION
+static void sensor_send_raw_metadata(void)
+{
+	const struct sensor_raw_collection_config config = {
+		.gyro_period = gyro_actual_time,
+		.accel_period = accel_actual_time,
+#if CONFIG_SENSOR_USE_MAGNETOMETER
+		.mag_period = mag_actual_time,
+#endif
+		.gyro_range = gyro_actual_range,
+		.accel_range = accel_actual_range,
+		.gyro_oversample_n = gyro_oversample_n,
+		.imu_id = (uint8_t)sensor_imu_id,
+#if CONFIG_SENSOR_USE_MAGNETOMETER
+		.mag_id = (uint8_t)sensor_mag_id,
+		.mag_active = mag_available && mag_enabled,
+#else
+		.mag_id = UINT8_MAX,
+#endif
+	};
+	sensor_raw_collection_send_metadata(&config);
+}
+#endif
+
+#if DEBUG
+static int64_t last_acquisition_time = INT64_MAX;
+static uint64_t total_acquisition_time = 0;
+static uint64_t total_read_packets = 0;
+static uint64_t total_processed_packets = 0;
+static uint64_t total_gyro_samples = 0;
+static uint64_t total_accel_samples = 0;
+static uint64_t total_loop_time = 0;
+static uint64_t total_loop_iterations = 0;
+#endif
+#if CONFIG_SENSOR_USE_MAGNETOMETER
+// Count actual mag samples fed to VQF since last status report (always tracked)
+static uint32_t mag_vqf_updates_since_status = 0;
+static float mag_feed_hz; /* last STATUS_INTERVAL window */
+
+void sensor_mag_ref_reset(void)
+{
+	sensor_fusion_reset_mag_ref();
+}
+
+/* q maps fusion body to earth. Earth up in body is row 3 of R(q).
+ * Invert the configured signed permutation (including reflected mag axes)
+ * by applying its transpose, not a quaternion/device-frame correction. */
+static bool sensor_mag_gravity(const float accel_sum[3], int accel_count, float raw_up[3])
+{
+	if (accel_count <= 0) {
+		return false;
+	}
+	float up[3];
+	if (sensor_fusion->get_quat6) {
+		float q[4];
+		sensor_fusion->get_quat6(q);
+		up[0] = 2.0f * (q[1] * q[3] - q[0] * q[2]);
+		up[1] = 2.0f * (q[2] * q[3] + q[0] * q[1]);
+		up[2] = 1.0f - 2.0f * (q[1] * q[1] + q[2] * q[2]);
+	} else {
+		/* EqF has no independent q6. Its IMU-only rest detector requires
+		 * gyro/accel stability and dwell; accept held orientations only. */
+		if (!sensor_fusion->get_rest_detected || !sensor_fusion->get_rest_detected()) {
+			return false;
+		}
+		float a_sq = 0.0f;
+		for (unsigned i = 0; i < 3; i++) {
+			up[i] = accel_sum[i] / accel_count;
+			a_sq += up[i] * up[i];
+		}
+		if (!(a_sq >= 0.7225f && a_sq <= 1.3225f)) {
+			return false;
+		}
+		float inv = 1.0f / sqrtf(a_sq);
+		for (unsigned i = 0; i < 3; i++) {
+			up[i] *= inv;
+		}
+	}
+	float norm_sq = 0.0f, dot = 0.0f, up_sq = 0.0f;
+	for (unsigned i = 0; i < 3; i++) {
+		float a = accel_sum[i] / accel_count;
+		norm_sq += a * a;
+		dot += a * up[i];
+		up_sq += up[i] * up[i];
+	}
+	/* Fresh calibrated acceleration, 0.85..1.15g and within 15 degrees
+	 * of independent inclination; equal-norm lateral acceleration is rejected. */
+	if (!(norm_sq >= 0.7225f && norm_sq <= 1.3225f && up_sq > 0.99f && up_sq < 1.01f
+		  && dot > 0.9659258f * sqrtf(norm_sq * up_sq))) {
+		return false;
+	}
+	float inv_up = 1.0f / sqrtf(up_sq);
+	for (unsigned axis = 0; axis < 3; axis++) {
+		float mx = axis == 0, my = axis == 1, mz = axis == 2;
+		float column[3] = {SENSOR_MAGNETOMETER_AXES_ALIGNMENT};
+		raw_up[axis] = (column[0] * up[0] + column[1] * up[1] + column[2] * up[2]) * inv_up;
+	}
+	return true;
+}
+#endif
+
+typedef struct {
+	uint32_t sensor_epoch;
+#if CONFIG_CONNECTION_RAW_COLLECTION
+	bool dc_active;
+#endif
+	uint16_t packets;
+#if CONFIG_SENSOR_USE_MAGNETOMETER
+	float raw_m[3];
+	bool new_mag_data;
+#endif
+#if CONFIG_CONNECTION_RAW_COLLECTION
+	float raw_collect_temp_c;
+#endif
+	int g_count;
+	float a_sum[3];
+	int a_count;
+	int processed_packets;
+#if DEBUG
+	bool valid_acquisition;
+	int64_t loop_begin;
+#endif
+} sensor_loop_frame_t;
+
+/* Persistent per-frame average accel (kept when a_count == 0). */
+static float sensor_loop_avg_a[3] = {0};
+
+static void feed_calibrated_gyro(float *g, float dt, int *g_count)
+{
+	sensor_diagnostics_on_cal_gyro(g);
+
+	if (!v_finite(g, 3) || !v_finite(&dt, 1) || dt <= 0.0f) sensor_motion_state.frame_invalid = true;
+
+	// Process fusion with calibrated gyro data
+	sensor_fusion->update_gyro(g, dt);
+	(*g_count)++;
+}
+
+#if CONFIG_SENSOR_ACCEL_OVERSAMPLING > 1
+/* Accel oversampling: average samples (noise reduction; not orientation strapdown). */
+static void oversample_accum3(float sum[3], const float sample[3])
+{
+#if CONFIG_CMSIS_DSP
+	arm_add_f32(sum, sample, sum, 3);
+#else
+	for (int j = 0; j < 3; j++) {
+		sum[j] += sample[j];
+	}
+#endif
+}
+
+/* Returns true when `n` samples accumulated; writes average to out_avg and resets. */
+static bool oversample_try_avg3(float sum[3], int *count, int n, float out_avg[3])
+{
+	(*count)++;
+	if (*count < n) {
+		return false;
+	}
+#if CONFIG_CMSIS_DSP
+	float scale = 1.0f / (float)n;
+	arm_scale_f32(sum, scale, out_avg, 3);
+	arm_fill_f32(0.0f, sum, 3);
+#else
+	for (int j = 0; j < 3; j++) {
+		out_avg[j] = sum[j] / (float)n;
+		sum[j] = 0;
+	}
+#endif
+	*count = 0;
+	return true;
+}
+#endif
+
+#if CONFIG_SENSOR_GYRO_OVERSAMPLING > 1
+static void gyro_dq_mul(const float q1[4], const float q2[4], float out[4])
+{
+	float w = q1[0] * q2[0] - q1[1] * q2[1] - q1[2] * q2[2] - q1[3] * q2[3];
+	float x = q1[0] * q2[1] + q1[1] * q2[0] + q1[2] * q2[3] - q1[3] * q2[2];
+	float y = q1[0] * q2[2] - q1[1] * q2[3] + q1[2] * q2[0] + q1[3] * q2[1];
+	float z = q1[0] * q2[3] + q1[1] * q2[2] - q1[2] * q2[1] + q1[3] * q2[0];
+	out[0] = w;
+	out[1] = x;
+	out[2] = y;
+	out[3] = z;
+}
+
+/*
+ * g_dps: firmware-compensated; fusion_bias_dps: frozen fusion residual.
+ * float + small-angle Taylor + soft renormalize (same Δq form as VQF).
+ */
+static void gyro_dq_accumulate_sample(const float g_dps[3], const float fusion_bias_dps[3], float dt)
+{
+	float wx = (g_dps[0] - fusion_bias_dps[0]) * DEG_TO_RAD;
+	float wy = (g_dps[1] - fusion_bias_dps[1]) * DEG_TO_RAD;
+	float wz = (g_dps[2] - fusion_bias_dps[2]) * DEG_TO_RAD;
+	float wn2 = wx * wx + wy * wy + wz * wz;
+	float dq[4];
+	if (wn2 > GYRO_DQ_EPS) {
+		float wn = sqrtf(wn2);
+		float half = 0.5f * wn * dt;
+		float c;
+		float s; /* sin(half)/wn == (dt/2)*sinc(half) */
+		if (half < GYRO_DQ_HALF_TAYLOR) {
+			float h2 = half * half;
+			c = 1.0f - 0.5f * h2 * (1.0f - h2 / 12.0f);
+			s = 0.5f * dt * (1.0f - h2 / 6.0f * (1.0f - h2 / 20.0f));
+		} else {
+			c = cosf(half);
+			s = sinf(half) / wn;
+		}
+		dq[0] = c;
+		dq[1] = s * wx;
+		dq[2] = s * wy;
+		dq[3] = s * wz;
+	} else {
+		dq[0] = 1.0f;
+		dq[1] = 0.0f;
+		dq[2] = 0.0f;
+		dq[3] = 0.0f;
+	}
+	float out[4];
+	gyro_dq_mul(gyro_dq_acc, dq, out);
+	/* Soft renormalize: q ← q*(1.5 - 0.5|q|²). */
+	float n2 = out[0] * out[0] + out[1] * out[1] + out[2] * out[2] + out[3] * out[3];
+	float scale = 1.5f - 0.5f * n2;
+	gyro_dq_acc[0] = out[0] * scale;
+	gyro_dq_acc[1] = out[1] * scale;
+	gyro_dq_acc[2] = out[2] * scale;
+	gyro_dq_acc[3] = out[3] * scale;
+}
+
+/*
+ * Merged Δq → ω_eq; re-add frozen fusion bias.
+ * atan2(|v|,w) > acos(w) for small windows.
+ */
+static void gyro_dq_to_feed_gyro(float g_feed_dps[3], float T_eff, const float fusion_bias_dps[3])
+{
+	float qw = gyro_dq_acc[0];
+	float qx = gyro_dq_acc[1];
+	float qy = gyro_dq_acc[2];
+	float qz = gyro_dq_acc[3];
+	if (qw < 0.0f) {
+		qw = -qw;
+		qx = -qx;
+		qy = -qy;
+		qz = -qz;
+	}
+	float vnorm = sqrtf(qx * qx + qy * qy + qz * qz);
+	float angle = 2.0f * atan2f(vnorm, qw);
+	float wr[3];
+	if (vnorm > GYRO_DQ_EPS && angle > GYRO_DQ_EPS) {
+		float half = 0.5f * angle;
+		float scale;
+		if (half < GYRO_DQ_HALF_TAYLOR) {
+			float h2 = half * half;
+			scale = (2.0f * (1.0f + h2 / 6.0f)) / T_eff;
+		} else {
+			scale = angle / (sinf(half) * T_eff);
+		}
+		wr[0] = qx * scale;
+		wr[1] = qy * scale;
+		wr[2] = qz * scale;
+	} else {
+		float scale = 2.0f / T_eff;
+		wr[0] = qx * scale;
+		wr[1] = qy * scale;
+		wr[2] = qz * scale;
+	}
+	g_feed_dps[0] = wr[0] * RAD_TO_DEG + fusion_bias_dps[0];
+	g_feed_dps[1] = wr[1] * RAD_TO_DEG + fusion_bias_dps[1];
+	g_feed_dps[2] = wr[2] * RAD_TO_DEG + fusion_bias_dps[2];
+}
+#endif
+
+void sensor_gyro_report_discontinuity(void)
+{
+	/* Zero dt is an explicit unknown-interval record, never a replacement
+	 * rate or an extension of the next sample's represented interval. The
+	 * queue's existing session lock/overflow policy owns its publication. */
+	static const float unknown_rate[3] = {0};
+	sensor_sample_gyro(unknown_rate, 0.0f);
+}
+
+static void sensor_reject_gyro_sample(void)
+{
+	sensor_motion_state.frame_invalid = true;
+	sensor_discard_gyro_window();
+}
+
+static void feed_gyro_sample(
+	float *raw_g,
+	int *g_count
+#if DEBUG
+	,
+	bool valid_acquisition
+#endif
+)
+{
+	if (!v_finite(raw_g, 3)) {
+		sensor_reject_gyro_sample();
+		return;
+	}
+	if (raw_g[0] == 0.0f && raw_g[1] == 0.0f && raw_g[2] == 0.0f) {
+		return;
+	}
+#if DEBUG
+	if (valid_acquisition) {
+		total_gyro_samples++;
+	}
+#endif
+	sensor_diagnostics_on_raw_gyro(raw_g);
+
+	/* --- Firmware compensation (layer 1): TCal / static ZRO / D_offset --- */
+	float reference_delta[3];
+	bool measured_reset = sensor_calibration_process_gyro(raw_g, gyro_actual_time, reference_delta);
+	float g[] = {raw_g[0], raw_g[1], raw_g[2]};
+
+#if CONFIG_SENSOR_USE_SENS_CALIBRATION
+	/* Firmware-ish scale; applied before fusion, same as non-OS path. */
+	sensor_calibration_apply_sensitivity(g, reference_delta);
+#endif
+	if (!v_finite(g, 3) || !v_finite(reference_delta, 3)) {
+		sensor_reject_gyro_sample();
+		return;
+	}
+
+	if (measured_reset) {
+		float zero[3] = {0};
+		if (sensor_fusion_init) {
+			/* Translate input histories, then accept the physical zero-bias
+			 * measurement rather than preserving the previous residual. */
+			sensor_fusion->rebase_gyro_bias(reference_delta);
+			sensor_fusion->set_gyro_bias(zero);
+		}
+#if CONFIG_SENSOR_GYRO_OVERSAMPLING > 1
+		/* A physical calibration is not a change of coordinates. */
+		gyro_oversample_count = 0;
+		gyro_dq_acc[0] = 1.0f;
+		gyro_dq_acc[1] = gyro_dq_acc[2] = gyro_dq_acc[3] = 0.0f;
+#endif
+	} else if (reference_delta[0] != 0.0f || reference_delta[1] != 0.0f || reference_delta[2] != 0.0f) {
+		if (sensor_fusion_init) {
+			sensor_fusion->rebase_gyro_bias(reference_delta);
+		}
+#if CONFIG_SENSOR_GYRO_OVERSAMPLING > 1
+		/* Keep already-integrated debiased samples; only their carrier changes. */
+		for (int i = 0; i < 3; i++) {
+			gyro_merge_bias_dps[i] += reference_delta[i];
+		}
+#endif
+	}
+
+#if CONFIG_SENSOR_GYRO_OVERSAMPLING > 1
+	/* I2C runs at the fusion ODR: match the non-oversampled feed exactly. */
+	if (gyro_oversample_n == 1) {
+		feed_calibrated_gyro(g, gyro_actual_time, g_count);
+		return;
+	}
+
+	/* Per-sample stats on firmware-compensated g; Δq merge; one fusion step. */
+	sensor_diagnostics_on_cal_gyro(g);
+
+	/* Freeze fusion residual bias for the whole window (layer 2). */
+	if (gyro_oversample_count == 0) {
+		if (sensor_fusion && sensor_fusion->get_gyro_bias) {
+			sensor_fusion->get_gyro_bias(gyro_merge_bias_dps);
+		} else {
+			gyro_merge_bias_dps[0] = gyro_merge_bias_dps[1] = gyro_merge_bias_dps[2] = 0.0f;
+		}
+	}
+	gyro_dq_accumulate_sample(g, gyro_merge_bias_dps, gyro_actual_time);
+	gyro_oversample_count++;
+	if (gyro_oversample_count < (int)gyro_oversample_n) {
+		return;
+	}
+
+	float g_feed[3];
+	gyro_dq_to_feed_gyro(g_feed, gyro_effective_time, gyro_merge_bias_dps);
+	if (!v_finite(g_feed, 3)) {
+		sensor_reject_gyro_sample();
+		return;
+	}
+	/* g_feed is post-firmware + fusion_bias carrier; update_gyro subtracts fusion bias. */
+	sensor_fusion->update_gyro(g_feed, gyro_effective_time);
+	(*g_count)++;
+
+	gyro_dq_acc[0] = 1.0f;
+	gyro_dq_acc[1] = 0.0f;
+	gyro_dq_acc[2] = 0.0f;
+	gyro_dq_acc[3] = 0.0f;
+	gyro_oversample_count = 0;
+#else
+	feed_calibrated_gyro(g, gyro_actual_time, g_count);
+#endif
+}
+
+static void feed_calibrated_accel(float *a, float dt, float *a_sum, int *a_count)
+{
+#if CONFIG_SENSOR_ACCEL_OVERSAMPLING <= 1
+	sensor_rest_detector_update_accel(&rest_detector, a, dt);
+	if (rest_detector.accel.frame_invalid) sensor_motion_state.frame_invalid = true;
+#endif
+
+	// Process fusion with calibrated accel data
+	sensor_fusion->update_accel(a, dt);
+
+	for (int i = 0; i < 3; i++) {
+		a_sum[i] += a[i];
+	}
+	(*a_count)++;
+}
+
+static void feed_accel_sample(
+	float *raw_a,
+	float *a_sum,
+	int *a_count
+#if DEBUG
+	,
+	bool valid_acquisition
+#endif
+)
+{
+#if DEBUG
+	if (valid_acquisition) {
+		total_accel_samples++;
+	}
+#endif
+	sensor_diagnostics_on_raw_accel(raw_a);
+
+#if CONFIG_SENSOR_ACCEL_OVERSAMPLING > 1
+	/* Observe each calibrated sample before averaging can hide a transient.
+	 * Do not enqueue extra calibration samples: its original merged cadence
+	 * and fusion cadence remain unchanged. */
+	float rest_a[3] = {raw_a[0], raw_a[1], raw_a[2]};
+	sensor_calibration_apply_accel(rest_a);
+	sensor_rest_detector_update_accel(&rest_detector, rest_a, accel_actual_time);
+	if (rest_detector.accel.frame_invalid) sensor_motion_state.frame_invalid = true;
+	oversample_accum3(accel_oversample_sum, raw_a);
+	float a_avg[3];
+	if (!oversample_try_avg3(accel_oversample_sum, &accel_oversample_count, CONFIG_SENSOR_ACCEL_OVERSAMPLING, a_avg)) {
+		return;
+	}
+
+	/* Keep the live accel snapshot and any active calibration FIFO up to date. */
+	sensor_calibration_process_accel(a_avg);
+	float a[] = {a_avg[0], a_avg[1], a_avg[2]};
+	feed_calibrated_accel(a, accel_effective_time, a_sum, a_count);
+#else
+	sensor_calibration_process_accel(raw_a);
+	float a[] = {raw_a[0], raw_a[1], raw_a[2]};
+	feed_calibrated_accel(a, accel_actual_time, a_sum, a_count);
+#endif
+}
+
+#if CONFIG_CONNECTION_RAW_COLLECTION
+static void sensor_loop_handle_data_collection(bool *dc_active)
+{
+	if (sensor_raw_collection_begin_frame(dc_active)) {
+		if (sys_interface_resume()) {
+			main_ok = false;
+			set_sensor_fault(SYS_SENSOR_FAULT_OTHER);
+			return;
+		}
+		sensor_send_raw_metadata();
+		LOG_INF("Data collection activated: metadata snapshot queued");
+	}
+}
+#endif
+
+static void sensor_loop_read_temperature(
+	sensor_loop_frame_t *frame
+#if CONFIG_SENSOR_TCAL_HEATED
+	, uint32_t temperature_read_epoch, int64_t temperature_sampled_at_ms
+#endif
+)
+{
+#if CONFIG_SENSOR_USE_TCAL
+	// Read IMU temperature after FIFO read so FIFO-backed drivers
+	// can return a sample synchronized with the current accel/gyro batch.
+#if CONFIG_SENSOR_TCAL_HEATED
+	if (temperature_read_epoch != temperature_filter_epoch) {
+		temperature_filter_epoch = temperature_read_epoch;
+		sensor_tcal_temp_filter_initialized = false;
+		heated_resting = false;
+	}
+#endif
+	temp = sensor_imu->temp_read();
+	// Only update if the value looks like a valid temperature (-20 to 60).
+	if (v_finite(&temp, 1) && temp != 0.0f && temp > -20.0f && temp < 60.0f) {
+		int64_t now_ms = k_uptime_get();
+#if CONFIG_CONNECTION_RAW_COLLECTION
+		last_temp_time = now_ms;
+#endif
+
+		// Keep last raw value for debugging/telemetry if needed
+		sensor_tcal_temp_raw = temp;
+
+		if (!sensor_tcal_temp_filter_initialized) {
+			sensor_tcal_temp = temp;
+			sensor_tcal_temp_filter_initialized = true;
+		} else {
+			int64_t dt_ms = now_ms - sensor_tcal_temp_filter_last_ms;
+			if (dt_ms < 0 || dt_ms > 10000) {
+				sensor_tcal_temp = temp;
+			} else {
+				if (dt_ms == 0) {
+					dt_ms = 1;
+				}
+				float dt = (float)dt_ms;
+				unsigned int tau_ms
+					= sensor_tcal_curve_apply_ready() ? SENSOR_TCAL_TEMP_CURVE_TAU_MS : SENSOR_TCAL_TEMP_FILTER_TAU_MS;
+				float alpha = dt / ((float)tau_ms + dt);
+				sensor_tcal_temp = sensor_tcal_temp + alpha * (temp - sensor_tcal_temp);
+			}
+		}
+		sensor_tcal_temp_filter_last_ms = now_ms;
+#if CONFIG_SENSOR_TCAL_HEATED
+		sensor_temperature_publish(temperature_read_epoch, temperature_sampled_at_ms);
+#endif
+
+		connection_update_sensor_temp(sensor_tcal_temp);
+	}
+#if CONFIG_SENSOR_TCAL_HEATED
+	else {
+		/* Invalid transactions must not leave an admissible cached reading.
+		 * In particular, an out-of-range hot reading is not mere absence. */
+		k_mutex_lock(&temperature_lifecycle_lock, K_FOREVER);
+		k_spinlock_key_t key = k_spin_lock(&temperature_observation_lock);
+		temperature_observation_valid = false;
+		k_spin_unlock(&temperature_observation_lock, key);
+		enum tcal_heated_stop_reason reason = v_finite(&temp, 1)
+			&& temp >= CONFIG_SENSOR_TCAL_HEATED_MAX_TEMP_C
+			? TCAL_HEATED_STOP_OVERTEMP : TCAL_HEATED_STOP_STALE_TEMP;
+		int err = sensor_tcal_heated_abort(reason);
+		if (err) {
+			LOG_ERR("Heater temperature fault shutdown failed: %d", err);
+		}
+		sensor_tcal_heated_set_ready(false);
+		k_mutex_unlock(&temperature_lifecycle_lock);
+	}
+#endif
+#else
+	// Read IMU temperature after FIFO read so FIFO-backed drivers can reuse it.
+	temp = sensor_imu->temp_read(); // TODO: use as calibration data
+#if CONFIG_CONNECTION_RAW_COLLECTION
+	last_temp_time = k_uptime_get();
+#endif
+	connection_update_sensor_temp(temp);
+#endif
+#if CONFIG_SENSOR_TCAL_HEATED
+	sensor_tcal_heated_update(heated_resting);
+#endif
+
+#if CONFIG_CONNECTION_RAW_COLLECTION
+	frame->raw_collect_temp_c = NAN;
+	int64_t temp_age_ms = k_uptime_get() - last_temp_time;
+#if CONFIG_SENSOR_USE_TCAL
+	if (last_temp_time >= 0 && temp_age_ms <= 1000) {
+		frame->raw_collect_temp_c = sensor_tcal_temp_filter_initialized ? sensor_tcal_temp : sensor_tcal_temp_raw;
+	}
+#else
+	if (last_temp_time >= 0 && temp_age_ms <= 1000) {
+		frame->raw_collect_temp_c = temp;
+	}
+#endif
+#else
+	ARG_UNUSED(frame);
+#endif
+}
+
+static void sensor_loop_apply_mode(void)
+{
+	switch (sensor_mode) {
+	case SENSOR_SENSOR_MODE_LOW_NOISE:
+		set_update_time_ms(CONFIG_SENSOR_UPDATE_TIME_LOW_NOISE_MS);
+		LOG_INF("Switching sensors to low noise");
+		break;
+	case SENSOR_SENSOR_MODE_LOW_POWER:
+		set_update_time_ms(33);
+		LOG_INF("Switching sensors to low power");
+		break;
+	case SENSOR_SENSOR_MODE_LOW_POWER_2:
+		set_update_time_ms(100);
+		LOG_INF("Switching sensors to low power 2");
+		break;
+	};
+}
+
+static void sensor_loop_acquire(sensor_loop_frame_t *frame)
+{
+#if CONFIG_SENSOR_TCAL_HEATED
+	uint32_t temperature_read_epoch = sensor_temperature_read_epoch();
+	/* FIFO-backed temperatures belong to this acquisition, not its eventual
+	 * completion. A blocked read must consume freshness, never extend it. */
+	int64_t temperature_sampled_at_ms = k_uptime_get();
+#endif
+	// Resume devices
+	int64_t resume_begin_ticks = k_uptime_ticks();
+	if (sys_interface_resume()) {
+		main_ok = false;
+		set_sensor_fault(SYS_SENSOR_FAULT_OTHER);
+		return;
+	}
+	uint64_t resume_us = k_ticks_to_us_near64(k_uptime_ticks() - resume_begin_ticks);
+	if (resume_us > sensor_window_resume_max_us) {
+		sensor_window_resume_max_us = resume_us;
+	}
+
+	// Trigger reconfig on sensor mode change
+	bool reconfig = last_sensor_mode != sensor_mode;
+	last_sensor_mode = sensor_mode;
+
+	// Reading IMUs will take between 2.5ms (~7 samples, low noise) - 7ms (~33 samples, low power)
+	// Magneto sample will take ~400us
+	// Fusing data will take between 100us (~7 samples, low noise) - 500us (~33 samples, low power)
+	// TODO: on any errors set main_ok false and skip (make functions return nonzero)
+
+	// Read gyroscope (FIFO)
+	// Buffer size calculation:
+	// - Worst case is ICM 20 byte packet
+	// - At 1600Hz gyro ODR with 6ms update interval: 1600 * 0.006 = ~10 packets
+	// - At 1000Hz ODR with 33ms low power update: 1000 * 0.033 = ~33 packets
+	// - At 1000Hz ODR with 100ms low power 2 update: 1000 * 0.100 = ~100 packets
+	// - With 4x oversampling at 1600Hz: effectively same as 400Hz but with 4x raw packets
+	uint8_t *rawData = sensor_fifo_raw_buffer;
+	int64_t fifo_begin_ticks = k_uptime_ticks();
+	frame->packets = sensor_imu->fifo_read(rawData, sizeof(sensor_fifo_raw_buffer));
+	uint64_t fifo_us = k_ticks_to_us_near64(k_uptime_ticks() - fifo_begin_ticks);
+	if (fifo_us > sensor_window_fifo_max_us) {
+		sensor_window_fifo_max_us = fifo_us;
+	}
+#if IMU_INT_EXISTS
+	if (sensor_fast_first_update_pending && frame->packets > 0) {
+		sensor_fast_first_update_pending = false;
+		if (sensor_fifo_threshold > 1) {
+			uint8_t restored_pin_config = sensor_imu->setup_DRDY(sensor_fifo_threshold);
+			if (!restored_pin_config) {
+				LOG_WRN("Failed to restore FIFO THS/WM/WTM to %d", sensor_fifo_threshold);
+			} else {
+				LOG_INF("Restored FIFO THS/WM/WTM to %d", sensor_fifo_threshold);
+			}
+		}
+	}
+#endif
+
+	sensor_loop_read_temperature(
+		frame
+#if CONFIG_SENSOR_TCAL_HEATED
+		, temperature_read_epoch, temperature_sampled_at_ms
+#endif
+	);
+
+	// Debug info
+#if DEBUG
+	int64_t acquisition_time = k_uptime_ticks();
+	frame->valid_acquisition = k_uptime_get() > ACQUISITION_START_MS
+							&& last_acquisition_time < acquisition_time; // wait before beginning profiling
+	if (frame->valid_acquisition) {
+		total_acquisition_time += acquisition_time - last_acquisition_time;
+		total_read_packets += frame->packets;
+	}
+	last_acquisition_time = acquisition_time;
+#endif
+
+#if CONFIG_SENSOR_USE_MAGNETOMETER
+	// Read magnetometer
+	frame->raw_m[0] = 0;
+	frame->raw_m[1] = 0;
+	frame->raw_m[2] = 0;
+	frame->new_mag_data = false;
+	if (mag_available && mag_enabled) {
+		int64_t now_ticks = k_uptime_ticks();
+		if (next_mag_read_ticks == 0 || now_ticks >= next_mag_read_ticks ||
+			(sensor_mag->cached_poll_safe && sensor_interface_mag_frame_ready())) {
+			frame->new_mag_data = sensor_mag->mag_read(frame->raw_m);
+			if (frame->new_mag_data) {
+				/* Preserve phase only for a due read less than one period late;
+				 * early cached reads must rebase rather than advance a future deadline. */
+				if (next_mag_read_ticks != 0 && now_ticks >= next_mag_read_ticks &&
+					now_ticks - next_mag_read_ticks < mag_read_period_ticks) {
+					next_mag_read_ticks += mag_read_period_ticks;
+				} else {
+					next_mag_read_ticks = now_ticks + mag_read_period_ticks;
+				}
+			}
+		}
+	}
+#if CONFIG_CONNECTION_RAW_COLLECTION
+	if (frame->new_mag_data
+	    && (connection_get_data_collection() || connection_get_data_collection_batch())) {
+		connection_queue_raw_mag(frame->raw_m);
+	}
+#endif
+#endif
+
+	if (reconfig) // TODO: get rid of reconfig?
+	{
+		// Apply the next loop's watermark after acquisition; drivers may retain FIFO records.
+		// TODO: causing warnings since packet processing and loop timing still expects previous update_time
+		sensor_loop_apply_mode();
+	}
+
+	/* Keep the IMU interface enabled across iterations; suspend/resume
+	 * churn is pure overhead at 400 Hz. Other power paths still suspend it
+	 * on long sleeps. */
+}
+
+static void sensor_loop_process_fifo(sensor_loop_frame_t *frame)
+{
+	// Fuse all data
+	frame->g_count = 0;
+	frame->a_sum[0] = 0;
+	frame->a_sum[1] = 0;
+	frame->a_sum[2] = 0;
+	frame->a_count = 0;
+	frame->processed_packets = 0;
+
+	sensor_diagnostics_reset_frame();
+
+	uint8_t *rawData = sensor_fifo_raw_buffer;
+	for (uint16_t i = 0; i < frame->packets; i++) {
+		float raw_a[3] = {0};
+		float raw_g[3] = {0};
+		if (sensor_imu->fifo_process(i, rawData, raw_a, raw_g)) {
+			continue; // No sample: includes benign metadata/empty/unsupported records.
+		}
+
+#if CONFIG_CONNECTION_RAW_COLLECTION
+		sensor_raw_collection_on_sample(raw_a, raw_g, frame->raw_collect_temp_c, frame->dc_active);
+#endif
+
+		sensor_diagnostics_on_decoded_gyro(raw_g);
+
+		feed_gyro_sample(
+			raw_g,
+			&frame->g_count
+#if DEBUG
+			,
+			frame->valid_acquisition
+#endif
+		);
+
+		if (raw_a[0] != 0 || raw_a[1] != 0 || raw_a[2] != 0) {
+			feed_accel_sample(
+				raw_a,
+				frame->a_sum,
+				&frame->a_count
+#if DEBUG
+				,
+				frame->valid_acquisition
+#endif
+			);
+		}
+
+		frame->processed_packets++;
+	}
+
+#if DEBUG
+	if (frame->valid_acquisition) {
+		total_processed_packets += frame->processed_packets;
+	}
+#endif
+}
+
+#if CONFIG_SENSOR_USE_MAGNETOMETER
+static void sensor_loop_process_mag(sensor_loop_frame_t *frame)
+{
+	if (mag_available && mag_enabled && frame->new_mag_data) {
+		mag_calibrated = true;
+		float uncalibrated_m[3] = {0};
+		memcpy(uncalibrated_m, frame->raw_m, sizeof(uncalibrated_m)); // copy raw magnetometer data
+
+		float gravity_raw[3] = {0};
+		bool gravity_valid = sensor_mag_gravity(frame->a_sum, frame->a_count, gravity_raw);
+		sensor_calibration_online_mag_sample(uncalibrated_m, gravity_raw, gravity_valid);
+		sensor_service_mag_ref();
+
+		sensor_calibration_process_mag(frame->raw_m);
+		float zero_m[3] = {0};
+		if (v_epsilon(frame->raw_m, zero_m, 1e-6)) // if the magnetometer is not calibrated, skip and send raw data
+		{
+			memcpy(frame->raw_m, uncalibrated_m, sizeof(uncalibrated_m));
+			mag_calibrated = false;
+		} else {
+			// Track calibrated mag norm for online quality assessment
+			// Only track when fusion reports no magnetic disturbance — including
+			// disturbed samples inflates norm CV and prevents online cal from stabilizing
+			if (!sensor_fusion_get_mag_dist_detected()) {
+				float cal_norm_sq = frame->raw_m[0] * frame->raw_m[0] + frame->raw_m[1] * frame->raw_m[1]
+								  + frame->raw_m[2] * frame->raw_m[2];
+				sensor_calibration_track_mag_norm(sqrtf(cal_norm_sq));
+			}
+		}
+		sensor_diagnostics_on_mag(uncalibrated_m, frame->raw_m);
+		float mx = frame->raw_m[0];
+		float my = frame->raw_m[1];
+		float mz = frame->raw_m[2];
+		float m[] = {SENSOR_MAGNETOMETER_AXES_ALIGNMENT};
+
+		if (mag_calibrated) {
+			int64_t now_ticks = k_uptime_ticks();
+			float mag_dt = mag_actual_time;
+			if (last_mag_fusion_ticks > 0) {
+				int64_t diff_ticks = now_ticks - last_mag_fusion_ticks;
+				if (diff_ticks > 0) {
+					mag_dt = (float)k_ticks_to_us_floor64(diff_ticks) * 1e-6f;
+				}
+			}
+			sensor_fusion->update_mag(m, mag_dt);
+			last_mag_fusion_ticks = now_ticks;
+			mag_vqf_updates_since_status++;
+		}
+
+		float mag_device[3];
+		sensor_rotate_sensor_vector_to_device_frame(m, mag_device);
+		connection_update_sensor_mag(mag_device);
+	}
+}
+#endif
+
+static bool sensor_sample_count_unexpected(int actual, float expected)
+{
+	if (actual == 0) {
+		return false;
+	}
+	int min_expected = (int)expected;
+	int max_expected = (int)(expected + 0.99f);
+	return actual < min_expected - 1 || actual > max_expected + 1;
+}
+
+static void sensor_loop_check_packets(sensor_loop_frame_t *frame, int64_t time_begin)
+{
+	// Copy average acceleration for this frame
+	if (frame->a_count > 0) {
+		for (int i = 0; i < 3; i++) {
+			sensor_loop_avg_a[i] = frame->a_sum[i] / frame->a_count;
+		}
+	}
+
+	// Check packet processing
+	int64_t now_ms = k_uptime_get();
+	if ((frame->packets != 0 || now_ms > 100) && frame->processed_packets == 0) {
+		if (frame->packets) {
+			LOG_WRN("No packets processed");
+			// Processing/parsing issue, not an empty FIFO condition.
+			no_packets_since_ms = 0;
+			no_packets_timeout_logged = false;
+		} else {
+			if (sensor_int_during_loop) {
+				LOG_DBG("No packets in buffer after in-loop INT");
+			} else {
+				LOG_WRN("No packets in buffer");
+				// If FIFO stays empty for long enough, raise a sensor error state.
+				if (no_packets_since_ms == 0) {
+					no_packets_since_ms = now_ms;
+				}
+				if (!no_packets_timeout_logged && (now_ms - no_packets_since_ms) >= NO_PACKETS_TIMEOUT_MS) {
+					LOG_ERR("No packets in buffer for %lldms", (long long)(now_ms - no_packets_since_ms));
+					set_sensor_fault(SYS_SENSOR_FAULT_OTHER);
+					no_packets_timeout_logged = true;
+				}
+			}
+		}
+		if (!sensor_int_during_loop && ++packet_errors == 10) {
+			LOG_ERR("Packet error threshold exceeded");
+			set_sensor_fault(SYS_SENSOR_FAULT_OTHER);
+			atomic_set(&sensor_recovery_pending, 1);
+		}
+	} else if (frame->processed_packets > 0) {
+		atomic_set(&sensor_progress, 1);
+		packet_errors = 0;
+		no_packets_since_ms = 0;
+		no_packets_timeout_logged = false;
+	}
+	sensor_int_during_loop = false;
+
+	// Check if expected number of timesteps when using FIFO threshold
+	// When accel and gyro have different ODRs, check them separately based on their expected rates
+	// The FIFO threshold is calculated based on the faster sensor, which determines interrupt timing
+	if (sensor_fifo_threshold && (frame->g_count || frame->a_count)) {
+		// Calculate expected samples based on target update time and actual elapsed time
+		int64_t elapsed_ms = k_uptime_get() - time_begin;
+		// Expected samples based on target update interval (sensor_update_time_ms)
+		float expected_gyro_samples = sensor_update_time_ms / 1000.0f / gyro_actual_time;
+		float expected_accel_samples = sensor_update_time_ms / 1000.0f / accel_actual_time;
+
+#if CONFIG_SENSOR_GYRO_OVERSAMPLING > 1
+		/* Δq-merge: one fusion gyro step per N high-rate samples (N may be 1 on I2C). */
+		float expected_gyro_timesteps_f = expected_gyro_samples / (float)gyro_oversample_n;
+		if (sensor_sample_count_unexpected(frame->g_count, expected_gyro_timesteps_f)) {
+			LOG_DBG(
+				"Expected ~%.1f gyro timesteps (Δq-merge %dx), got %d (elapsed %lldms)",
+				(double)expected_gyro_timesteps_f,
+				gyro_oversample_n,
+				frame->g_count,
+				elapsed_ms
+			);
+		}
+#else
+		// Check gyro samples: allow reasonable tolerance for timing variations
+		// Since FIFO threshold uses floor(), actual samples can range from floor to floor+1
+		if (sensor_sample_count_unexpected(frame->g_count, expected_gyro_samples)) {
+			LOG_DBG(
+				"Expected ~%.1f gyro samples, got %d (elapsed %lldms)",
+				(double)expected_gyro_samples,
+				frame->g_count,
+				elapsed_ms
+			);
+		}
+#endif
+
+#if CONFIG_SENSOR_ACCEL_OVERSAMPLING > 1
+		// With accel oversampling, expected fusion timesteps is reduced by oversampling factor
+		float expected_accel_timesteps_f = expected_accel_samples / CONFIG_SENSOR_ACCEL_OVERSAMPLING;
+		// Only warn if actual count is significantly off
+		if (sensor_sample_count_unexpected(frame->a_count, expected_accel_timesteps_f)) {
+			LOG_DBG(
+				"Expected ~%.1f accel timesteps (oversampling %dx), got %d (elapsed %lldms)",
+				(double)expected_accel_timesteps_f,
+				CONFIG_SENSOR_ACCEL_OVERSAMPLING,
+				frame->a_count,
+				elapsed_ms
+			);
+		}
+#else
+		// Check accel samples: allow reasonable tolerance for timing variations
+		if (sensor_sample_count_unexpected(frame->a_count, expected_accel_samples)) {
+			LOG_DBG(
+				"Expected ~%.1f accel samples, got %d (elapsed %lldms)",
+				(double)expected_accel_samples,
+				frame->a_count,
+				elapsed_ms
+			);
+		}
+#endif
+	}
+}
+
+static void sensor_loop_publish(sensor_loop_frame_t *frame)
+{
+	// Get updated quaternion from fusion
+	sensor_fusion->get_quat(q);
+	float q_norm2 = q[0]*q[0] + q[1]*q[1] + q[2]*q[2] + q[3]*q[3];
+	bool valid_q = v_finite(q, 4) && v_finite(&q_norm2, 1) && q_norm2 > 0.0f;
+	if (valid_q) q_normalize(q, q);
+
+	/* Magnetic heading convergence is not physical motion. Prefer the
+	 * backend's independent IMU attitude for rest and session activity.
+	 * Backends without it (EqF) retain their existing attitude policy. An
+	 * invalid available 6D estimate must not fall back to corrected output. */
+	float q6[4];
+	float *motion_q = q;
+	if (valid_q && sensor_fusion->get_quat6) {
+		sensor_fusion->get_quat6(q6);
+		float norm2 = q6[0]*q6[0] + q6[1]*q6[1] + q6[2]*q6[2] + q6[3]*q6[3];
+		if (v_finite(q6, 4) && v_finite(&norm2, 1) && norm2 > 0.0f) {
+			q_normalize(q6, q6);
+		}
+		motion_q = q6;
+	}
+
+	// Get linear acceleration
+	float lin_a[3] = {0};
+	if (valid_q && v_diff_mag(sensor_loop_avg_a, lin_a) != 0) {
+		a_to_lin_a(q, sensor_loop_avg_a, lin_a);
+	}
+
+	int64_t now = k_uptime_get();
+	float angular_speed_dps, lin_accel;
+	bool resting;
+	bool observed = sensor_motion_observe(frame->sensor_epoch, frame->g_count, frame->a_count,
+		motion_q, lin_a, now, &resting, &angular_speed_dps, &lin_accel);
+	/* Consume even an invalidated/suspended frame so stale detector work
+	 * cannot become a fresh observation after resume. */
+	bool fusion_rest = false;
+	bool fusion_fresh = sensor_fusion->take_rest_observation
+		&& sensor_fusion->take_rest_observation(&fusion_rest);
+	uint8_t backend = FUSION_BACKEND_UNKNOWN;
+	if (sensor_fusion->take_rest_observation) {
+		if (fusion_id == FUSION_VQF) {
+			backend = FUSION_BACKEND_VQF;
+		} else if (fusion_id == FUSION_EQF) {
+			backend = FUSION_BACKEND_EQF;
+		}
+	}
+	if (sensor_motion_frame_current(frame->sensor_epoch)) {
+		tracker_events_observe_sensor(frame->sensor_epoch, observed, resting,
+			fusion_fresh, fusion_rest, backend, (uint32_t)now);
+		tracker_events_notify();
+	}
+	/* Validate before local power/calibration consumers, not just telemetry.
+	 * Empty or unknown evidence never grants sleeping/calibration eligibility. */
+	resting = resting && observed && sensor_motion_frame_current(frame->sensor_epoch);
+#if CONFIG_SENSOR_TCAL_HEATED
+	heated_resting = resting;
+	sensor_tcal_heated_update(resting);
+#endif
+	if (observed && sensor_motion_frame_current(frame->sensor_epoch)) {
+		if (angular_speed_dps >= 0.0f)
+			sensor_update_session_motion(angular_speed_dps, lin_accel, now);
+	} else {
+#if CONFIG_DYNAMIC_ACTIVE_TIMEOUT
+		sensor_session_activity_score.last_update_ms = -1;
+#endif
+	}
+	sensor_update_sensor_state(resting);
+	if (!valid_q || !sensor_motion_frame_current(frame->sensor_epoch)) {
+		atomic_clear(&output_ready);
+#if CONFIG_SENSOR_USE_TCAL
+		sensor_tcal_continuous_motion_detected();
+#endif
+		return;
+	}
+	atomic_set(&output_ready, v_finite(lin_a, 3));
+
+	sensor_diagnostics_output(q, lin_a, sensor_loop_avg_a, temp, sensor_get_mag_enabled());
+
+	// Update orientation
+	bool send_quat_data = !q_epsilon(q, last_q, 0.001f);
+	bool send_lin_accel_data = !v_epsilon(lin_a, last_lin_a, 0.04f);
+
+	// Check if we need to force send based on time to maintain minimum packet rate
+	now = k_uptime_get();
+	int64_t min_interval = test_mode_min_send_interval_ms();
+	bool force_send_by_time = (now - last_sensor_send_time) >= min_interval;
+
+	if (send_quat_data || send_lin_accel_data || force_send_by_time) {
+		float dq_dot = fabsf(q[0] * last_q[0] + q[1] * last_q[1] + q[2] * last_q[2] + q[3] * last_q[3]);
+		if (dq_dot > 1.0f) {
+			dq_dot = 1.0f;
+		}
+		sensor_window_fused_angle_rad += 2.0f * acosf(dq_dot);
+		sensor_window_publishes++;
+		memcpy(last_q, q, sizeof(q));
+		memcpy(last_lin_a, lin_a, sizeof(lin_a));
+		float device_quat[4];
+		float reported_quat[4];
+		sensor_compute_device_and_reported_quat(q, device_quat, reported_quat);
+		sensor_rotate_sensor_vector_to_device_frame(lin_a, lin_a);
+
+		if (!send_quat_data && !send_lin_accel_data) {
+			memset(lin_a, 0, sizeof(lin_a)); // zero out linear acceleration when no motion detected
+		}
+
+		connection_update_sensor_data(reported_quat, lin_a);
+		last_sensor_send_time = now;
+
+		if (!resting) {
+			last_data_time = now;
+		}
+	}
+
+#if CONFIG_SENSOR_USE_TCAL
+	resting = resting && sensor_motion_frame_current(frame->sensor_epoch);
+	// Check for boot calibration (higher priority than auto calibration)
+	sensor_tcal_boot_calibration_check();
+
+	// Notify continuous bucket sampling of motion state changes
+	if (!resting) {
+		sensor_tcal_continuous_motion_detected();
+	}
+
+	// Check for automatic temperature calibration (only when device is resting)
+	// With continuous bucket sampling, this is only used for initial calibration
+	// when no T-Cal data exists at all.
+	if (resting) {
+		float current_temp = temp;
+		if (!isnan(current_temp)) {
+			sensor_tcal_check_auto_calibration(current_temp);
+		}
+	}
+#endif
+
+	// Periodic retained save for crash recovery
+	if (now - last_retained_save_time >= RETAINED_SAVE_INTERVAL_MS) {
+		sensor_retained_write();
+		last_retained_save_time = now;
+		LOG_DBG("Periodic retained save completed");
+	}
+
+#if DEBUG
+	if (frame->valid_acquisition) {
+		total_loop_time += k_uptime_ticks() - frame->loop_begin;
+		total_loop_iterations++;
+	}
+#endif
+}
+
+static void sensor_loop_wait(int64_t time_begin)
+{
+	/* Feed watchdog at end of each loop iteration */
+	watchdog_feed(WDT_CHANNEL_SENSOR);
+
+	sensor_life_mark_idle();
+	int64_t time_delta = k_uptime_get() - time_begin;
+
+	if (time_delta > 0) {
+		float delta_ms = (float)time_delta;
+		if (processing_work_time_ema_ms <= 0.0f) {
+			processing_work_time_ema_ms = delta_ms;
+		} else {
+			processing_work_time_ema_ms = 0.9f * processing_work_time_ema_ms + 0.1f * delta_ms;
+		}
+	}
+
+	if (time_delta > sensor_update_time_ms && time_delta > max_loop_time) {
+		max_loop_time = time_delta;
+	}
+
+	if (k_uptime_get() - last_status_time > STATUS_INTERVAL_MS) {
+		last_status_time = k_uptime_get();
+		if (max_loop_time > 0) {
+			/* Only warn when the processing EMA shows the loop is
+			 * genuinely falling behind; single preempted iterations are
+			 * absorbed by the FIFO/catch-up. */
+			if (processing_work_time_ema_ms > (float)sensor_update_time_ms * 1.5f) {
+				LOG_WRN("Last update steps took up to %lld ms", max_loop_time);
+			} else {
+				LOG_DBG("Slow loop step %lld ms ignored (EMA %.2f ms)", max_loop_time, (double)processing_work_time_ema_ms);
+			}
+			max_loop_time = 0;
+		}
+		if (sensor_int_timeouts > 0) {
+			LOG_WRN("Sensor INT timeouts: %u in last %d s", sensor_int_timeouts, STATUS_INTERVAL_MS / 1000);
+			sensor_int_timeouts = 0;
+		}
+		if (sensor_window_iters > 0) {
+			uint32_t win_s = STATUS_INTERVAL_MS / 1000;
+			LOG_DBG(
+				"sensor window: loop %.0f Hz, publish %.0f/s, fused %.1f deg/s, proc %.2f ms (acq %.2f vqf %.2f), wait "
+				"%.2f ms, pkts/loop %.1f, ints/s %.0f, max acq %.2f (rs %.2f fifo %.2f) proc %.2f ms",
+				(double)sensor_window_iters / (double)win_s,
+				(double)sensor_window_publishes / (double)win_s,
+				(double)(sensor_window_fused_angle_rad * 180.0f / 3.14159265f / (float)win_s),
+				(double)sensor_window_proc_us / (double)sensor_window_iters / 1000.0,
+				(double)sensor_window_acq_us / (double)sensor_window_iters / 1000.0,
+				(double)sensor_window_vqf_us / (double)sensor_window_iters / 1000.0,
+				(double)sensor_window_wait_us / (double)sensor_window_iters / 1000.0,
+				(double)sensor_window_packets / (double)sensor_window_iters,
+				(double)sensor_window_ints / (double)win_s,
+				(double)sensor_window_acq_max_us / 1000.0,
+				(double)sensor_window_resume_max_us / 1000.0,
+				(double)sensor_window_fifo_max_us / 1000.0,
+				(double)sensor_window_proc_max_us / 1000.0
+			);
+			sensor_window_iters = 0;
+			sensor_window_publishes = 0;
+			sensor_window_fused_angle_rad = 0.0f;
+			sensor_window_proc_us = 0;
+			sensor_window_wait_us = 0;
+			sensor_window_packets = 0;
+			sensor_window_acq_us = 0;
+			sensor_window_vqf_us = 0;
+			sensor_window_ints = 0;
+			sensor_window_acq_max_us = 0;
+			sensor_window_proc_max_us = 0;
+			sensor_window_resume_max_us = 0;
+			sensor_window_fifo_max_us = 0;
+		}
+#if CONFIG_SENSOR_USE_MAGNETOMETER
+		if (mag_available && mag_enabled) {
+			mag_feed_hz = mag_vqf_updates_since_status * 1000.0f / (float)STATUS_INTERVAL_MS;
+			// Report actual rate of mag samples fed into VQF (target: mag ODR, e.g. 50Hz)
+			if (sensor_debug_is_active()) {
+				LOG_INF(
+					"mag VQF updates: %u in last %dms (%.1fHz, target %.0fHz)",
+					mag_vqf_updates_since_status,
+					STATUS_INTERVAL_MS,
+					(double)mag_feed_hz,
+					1.0 / (double)mag_actual_time
+				);
+			}
+			mag_vqf_updates_since_status = 0;
+		} else {
+			mag_feed_hz = 0.0f;
+		}
+#endif
+#if DEBUG
+		LOG_DBG(
+			"loop iterations: %llu, packets read: %llu, processed: %llu, gyro samples: %llu, accel samples: %llu, "
+			"total acquisition time: %lld us, total loop time: %lld us",
+			total_loop_iterations,
+			total_read_packets,
+			total_processed_packets,
+			total_gyro_samples,
+			total_accel_samples,
+			k_ticks_to_us_near64(total_acquisition_time),
+			k_ticks_to_us_near64(total_loop_time)
+		);
+		LOG_DBG(
+			"sensor loop rate: %.2fHz, processing time: %.2f/%.2f us -> %.2f%%",
+			(double)total_loop_iterations / (double)k_ticks_to_us_near64(total_acquisition_time) * 1000000.0,
+			(double)k_ticks_to_us_near64(total_loop_time) / (double)total_loop_iterations,
+			(double)k_ticks_to_us_near64(total_acquisition_time) / (double)total_loop_iterations,
+			(double)total_loop_time / (double)total_acquisition_time * 100.0
+		);
+		LOG_DBG(
+			"reported gyro rate: %.2fHz, actual: %.2fHz, reported accel rate: %.2fHz, actual: %.2fHz",
+			1.0 / (double)gyro_actual_time,
+			(double)total_gyro_samples / (double)k_ticks_to_us_near64(total_acquisition_time) * 1000000.0,
+			1.0 / (double)accel_actual_time,
+			(double)total_accel_samples / (double)k_ticks_to_us_near64(total_acquisition_time) * 1000000.0
+		);
+#endif
+	}
+
+#if IMU_INT_EXISTS
+	int64_t wait_begin_ticks = k_uptime_ticks();
+	if (k_sem_take(&sensor_int_sem, K_NO_WAIT) == 0) {
+		/* INT arrived while the loop was still processing: loop immediately to catch up. */
+		LOG_DBG("FIFO THS/WM/WTM triggered during loop");
+		sensor_int_during_loop = true;
+		k_yield();
+	} else if (k_sem_take(&sensor_int_sem, K_MSEC(sensor_update_time_ms + 10)) != 0) {
+		/* No INT in the window - FIFO watermark edge was missed or not produced. */
+		sensor_int_timeouts++;
+		LOG_DBG("Sensor interrupt timeout (%u)", sensor_int_timeouts);
+	}
+	sensor_window_wait_us += k_ticks_to_us_near64(k_uptime_ticks() - wait_begin_ticks);
+#else
+	// TODO: old behavior
+	//		led_clock_offset += time_delta;
+	if (time_delta > sensor_update_time_ms) {
+		k_yield();
+	} else {
+		k_msleep(sensor_update_time_ms - time_delta);
+	}
+#endif
+
+	if (atomic_get(&main_suspended)) {
+		if (sensor_fusion->take_rest_observation) {
+			sensor_fusion->take_rest_observation(NULL);
+		}
+	}
+
+	sensor_life_mark_busy();
+}
+
+static void sensor_loop(void)
+{
+	/* The gate precedes even initialization: main_running is not yet true
+	 * when this thread first becomes eligible to access the bus. */
+	if (!sensor_loop_enter()) {
+		return;
+	}
+#if CONFIG_SENSOR_TCAL_HEATED
+	int heater_err = sensor_temperature_invalidate();
+	if (heater_err) {
+		LOG_ERR("Sensor initialization blocked by heater shutdown: %d", heater_err);
+		sensor_calibration_stage(initialization_feedback, LED_NONE);
+		initialization_feedback = (struct led_token){0};
+		sensor_loop_leave();
+		return;
+	}
+	heated_resting = false;
+#endif
+	sensor_calibration_set_consumer_ready(false);
+	main_ok = false;
+	if (!sensor_sensor_init) {
+		sensor_calibration_stage(initialization_feedback, LED_NONE);
+		initialization_feedback = (struct led_token){0};
+		sensor_loop_leave();
+		return;
+	}
+	sensor_life_mark_busy();
+	/* Register before bus operations so a blocked initialization is covered. */
+	if (watchdog_register_thread(WDT_CHANNEL_SENSOR, 0) < 0) {
+		LOG_ERR("Sensor watchdog registration failed");
+		sys_reboot(SYS_REBOOT_COLD);
+		sensor_loop_leave();
+		return;
+	}
+	int err = sys_interface_resume();
+	if (!err) {
+		err = sensor_init();
+	}
+	// TODO: handle imu init error, maybe restart device?
+	// TODO: on failure to init, disable sensor interface
+	if (err) {
+		set_sensor_fault_if_unset(SYS_SENSOR_FAULT_OTHER);
+	} else {
+		main_ok = true;
+		sensor_calibration_set_consumer_ready(!atomic_get(&main_suspended));
+#if CONFIG_SENSOR_TCAL_HEATED
+		sensor_temperature_resume();
+#endif
+		sensor_startup_discard_until_ms = k_uptime_get() + CONFIG_SENSOR_STARTUP_DISCARD_MS;
+		sensor_startup_discard_logged = false;
+	}
+	sensor_calibration_stage(initialization_feedback, LED_NONE);
+	initialization_feedback = (struct led_token){0};
+	sensor_loop_leave();
+	while (1) {
+		if (!sensor_loop_enter()) {
+			return;
+		}
+		int64_t time_begin = k_uptime_get();
+		sensor_window_iters++;
+		if (main_ok && sensor_calibration_imu_ready()) {
+			int64_t proc_begin_ticks = k_uptime_ticks();
+			sensor_loop_frame_t frame = {0};
+#if DEBUG
+			frame.loop_begin = k_uptime_ticks();
+#endif
+
+#if CONFIG_SENSOR_TCAL_HEATED
+			sensor_tcal_heated_update(heated_resting);
+#endif
+			sensor_apply_calibration_frame();
+			frame.sensor_epoch = tracker_events_sensor_epoch();
+#if CONFIG_CONNECTION_RAW_COLLECTION
+			sensor_loop_handle_data_collection(&frame.dc_active);
+			if (!main_ok) {
+				sensor_loop_wait(time_begin);
+				sensor_loop_leave();
+				continue;
+			}
+#endif
+			int64_t acq_begin_ticks = k_uptime_ticks();
+			sensor_loop_acquire(&frame);
+			if (!main_ok) {
+				sensor_loop_wait(time_begin);
+				sensor_loop_leave();
+				continue;
+			}
+			uint64_t acq_us = k_ticks_to_us_near64(k_uptime_ticks() - acq_begin_ticks);
+			sensor_window_acq_us += acq_us;
+			if (acq_us > sensor_window_acq_max_us) {
+				sensor_window_acq_max_us = acq_us;
+			}
+			if (sensor_startup_discard_until_ms > 0 && k_uptime_get() < sensor_startup_discard_until_ms) {
+				/* Skip the gyro power-on settle transient for every IMU:
+				 * drain the FIFO but feed nothing to fusion. */
+				if (!sensor_startup_discard_logged) {
+					LOG_DBG("Discarding startup IMU samples for %d ms", CONFIG_SENSOR_STARTUP_DISCARD_MS);
+					sensor_startup_discard_logged = true;
+				}
+			} else {
+				int64_t vqf_begin_ticks = k_uptime_ticks();
+				sensor_motion_prepare(frame.sensor_epoch, k_uptime_get());
+				if (!sensor_motion_frame_current(frame.sensor_epoch)) {
+					/* Finish the iteration and release the activity lock
+					 * before the suspension owner uses the sensor bus. */
+					sensor_loop_wait(time_begin);
+					sensor_loop_leave();
+					continue;
+				}
+				sensor_loop_process_fifo(&frame);
+				sensor_window_vqf_us += k_ticks_to_us_near64(k_uptime_ticks() - vqf_begin_ticks);
+#if CONFIG_SENSOR_USE_MAGNETOMETER
+				sensor_loop_process_mag(&frame);
+#endif
+				sensor_loop_check_packets(&frame, time_begin);
+				sensor_loop_publish(&frame);
+				uint64_t proc_us = k_ticks_to_us_near64(k_uptime_ticks() - proc_begin_ticks);
+				sensor_window_proc_us += proc_us;
+				if (proc_us > sensor_window_proc_max_us) {
+					sensor_window_proc_max_us = proc_us;
+				}
+			}
+			sensor_window_packets += frame.packets;
+		}
+
+		sensor_loop_wait(time_begin);
+		sensor_loop_leave();
+	}
+}
+
+void wait_for_threads(void)
+{
+	if (!main_running) {
+		return;
+	}
+	if (k_event_wait(&sensor_life_events, SENSOR_LIFE_IDLE, false, K_MSEC(5000)) == 0) {
+		LOG_WRN("wait_for_threads timed out (main_running=%d)", main_running);
+	}
+}
+
+int main_imu_suspend(void)
+{
+	if (k_current_get() == &sensor_thread_id) {
+		return -EDEADLK;
+	}
+	int err = sensor_lifecycle_lock_take();
+	if (err) {
+		LOG_ERR("Sensor suspension lifecycle wait timed out");
+		return err;
+	}
+	if (sensor_thread_role == SENSOR_THREAD_SCAN) {
+		LOG_ERR("Sensor scan has not been joined");
+		err = -EBUSY;
+		goto unlock_lifecycle;
+	}
+	if (atomic_get(&main_suspended)) {
+		if (sensor_suspend_owner) {
+			err = sensor_suspend_owner == k_current_get() ? 0 : -EBUSY;
+			goto unlock_lifecycle;
+		}
+#if CONFIG_SENSOR_TCAL_HEATED
+		/* A failed restart may have left heater shutdown incomplete. */
+		err = sensor_temperature_invalidate();
+		if (err) {
+			LOG_ERR("Sensor recovery blocked by heater shutdown: %d", err);
+			goto unlock_lifecycle;
+		}
+#endif
+		sensor_suspend_owner = k_current_get();
+		goto unlock_lifecycle;
+	}
+#if CONFIG_SENSOR_TCAL_HEATED
+	/* Close publication/admission before requesting the owner to suspend. */
+	err = sensor_temperature_invalidate();
+	if (err) {
+		LOG_ERR("Sensor suspension blocked by heater shutdown: %d", err);
+		goto unlock_lifecycle;
+	}
+#endif
+	atomic_set(&main_suspended, true);
+	atomic_clear(&output_ready);
+	sensor_calibration_set_consumer_ready(false);
+	sys_cancel_WOM();
+	tracker_events_sensor_invalidate(TRACKER_REST_SUSPENDED);
+	tracker_events_notify();
+
+	/* This covers both initialization and complete loop iterations. Never
+	 * suspend/abort a thread in a driver, and never pause its watchdog until
+	 * the activity owner has actually left the bus. */
+	err = sensor_activity_quiesce();
+	if (err) {
+		LOG_ERR("Sensor suspension activity wait timed out");
+		atomic_clear(&main_suspended);
+		sensor_calibration_set_consumer_ready(main_ok);
+#if CONFIG_SENSOR_TCAL_HEATED
+		sensor_temperature_resume();
+#endif
+		k_sem_give(&sensor_loop_gate);
+		goto unlock_lifecycle;
+	}
+	atomic_clear(&output_ready);
+	sensor_suspend_owner = k_current_get();
+	if (sensor_thread_role == SENSOR_THREAD_LOOP) {
+		watchdog_pause(WDT_CHANNEL_SENSOR);
+	}
+	if (sensor_fusion->take_rest_observation) {
+		sensor_fusion->take_rest_observation(NULL);
+	}
+	k_mutex_unlock(&sensor_activity_lock);
+	LOG_INF("Suspended sensor thread");
+unlock_lifecycle:
+	k_mutex_unlock(&sensor_lifecycle_lock);
+	return err;
+}
+
+void main_imu_resume(void)
+{
+	if (k_current_get() == &sensor_thread_id) {
+		LOG_ERR("Sensor cannot resume itself");
+		return;
+	}
+	k_mutex_lock(&sensor_lifecycle_lock, K_FOREVER);
+	if (!atomic_get(&main_suspended)) {
+		k_mutex_unlock(&sensor_lifecycle_lock);
+		return;
+	}
+	if (sensor_suspend_owner != k_current_get()) {
+		LOG_WRN("Sensor resume rejected: suspension belongs to another thread");
+		k_mutex_unlock(&sensor_lifecycle_lock);
+		return;
+	}
+	tracker_events_sensor_invalidate(TRACKER_REST_INITIALIZING);
+	tracker_events_notify();
+	if (sensor_thread_role == SENSOR_THREAD_LOOP) {
+		watchdog_resume(WDT_CHANNEL_SENSOR);
+	}
+	sensor_calibration_set_consumer_ready(main_ok);
+	sensor_suspend_owner = NULL;
+	/* Publish readiness before the higher-priority loop can leave its gate. */
+	atomic_clear(&main_suspended);
+#if CONFIG_SENSOR_TCAL_HEATED
+	sensor_temperature_resume();
+#endif
+	k_sem_give(&sensor_loop_gate);
+	k_mutex_unlock(&sensor_lifecycle_lock);
+	LOG_INF("Resumed sensor thread");
+}
+
+int main_imu_restart(void)
+{
+#if CONFIG_SENSOR_TCAL_HEATED
+	int err = sensor_temperature_invalidate();
+	if (err) {
+		return err;
+	}
+	heated_resting = false;
+#endif
+	sensor_discard_partial_samples();
+	atomic_clear(&output_ready);
+	sensor_calibration_reset_gyro_reference();
+	sys_cancel_WOM();
+	tracker_events_sensor_invalidate(TRACKER_REST_RESET);
+	tracker_events_notify();
+#if CONFIG_SENSOR_USE_MAGNETOMETER
+	sensor_mag_timing_reset();
+#endif
+	if (main_ok) // only restart fusion if initialized
+	{
+		struct fusion_periods periods = sensor_fusion_periods();
+#if CONFIG_SENSOR_USE_MAGNETOMETER
+		float saved_ref_norm = 0.0f, saved_ref_dip = 0.0f;
+		bool had_mag_ref = sensor_fusion_get_mag_ref(&saved_ref_norm, &saved_ref_dip);
+#endif
+		sensor_fusion->init(periods.gyro, periods.accel, periods.mag);
+#if CONFIG_SENSOR_USE_MAGNETOMETER
+		if (had_mag_ref && saved_ref_norm > 0) {
+			sensor_fusion_set_mag_ref(saved_ref_norm, saved_ref_dip);
+		}
+		sensor_finish_mag_fusion_restart(true);
+#endif
+	}
+#if CONFIG_SENSOR_TCAL_HEATED
+	sensor_temperature_resume();
+#endif
+	return 0;
+}
+
+#if CONFIG_SENSOR_USE_TCAL
+float sensor_get_current_imu_temperature(void)
+{
+	return sensor_tcal_temp_filter_initialized ? sensor_tcal_temp : sensor_tcal_temp_raw;
+}
+#endif
+
+// Get actual accelerometer ODR in Hz
+float sensor_get_accel_odr(void)
+{
+	if (accel_actual_time > 0.0f) {
+		return 1.0f / accel_actual_time;
+	}
+	return (float)CONFIG_SENSOR_ACCEL_ODR; // Fallback to config value
+}
+
+// Get actual gyroscope ODR in Hz
+float sensor_get_gyro_odr(void)
+{
+	if (gyro_actual_time > 0.0f) {
+		return 1.0f / gyro_actual_time;
+	}
+	return (float)CONFIG_SENSOR_GYRO_ODR; // Fallback to config value
+}
+
+float sensor_get_mag_odr(void)
+{
+#if CONFIG_SENSOR_USE_MAGNETOMETER
+	if (!mag_available) {
+		return 0.0f;
+	}
+	/* Prefer driver period; some update_odr paths leave INFINITY. */
+	if (mag_actual_time > 0.0f && mag_actual_time < 1.0f) {
+		return 1.0f / mag_actual_time;
+	}
+	/* Kconfig fallback only after mag has been brought up. */
+	if (mag_enabled) {
+		return (float)CONFIG_SENSOR_MAG_ODR;
+	}
+#endif
+	return 0.0f;
+}
+
+float sensor_get_mag_feed_hz(void)
+{
+#if CONFIG_SENSOR_USE_MAGNETOMETER
+	if (!mag_available || !mag_enabled) {
+		return 0.0f;
+	}
+	return mag_feed_hz;
+#else
+	return 0.0f;
+#endif
+}
+
+float sensor_get_fusion_rate(void)
+{
+#if CONFIG_SENSOR_GYRO_OVERSAMPLING > 1
+	if (gyro_oversample_n > 1 && gyro_effective_time > 0.0f) {
+		return 1.0f / gyro_effective_time;
+	}
+#endif
+	return sensor_get_gyro_odr();
+}
+
+float sensor_get_processing_work_time_ms(void)
+{
+	return processing_work_time_ema_ms;
+}
+

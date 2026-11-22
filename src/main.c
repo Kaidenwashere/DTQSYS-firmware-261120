@@ -1,0 +1,157 @@
+/*
+	SlimeVR Code is placed under the MIT license
+	Copyright (c) 2025 SlimeVR Contributors
+
+	Permission is hereby granted, free of charge, to any person obtaining a copy
+	of this software and associated documentation files (the "Software"), to deal
+	in the Software without restriction, including without limitation the rights
+	to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+	copies of the Software, and to permit persons to whom the Software is
+	furnished to do so, subject to the following conditions:
+
+	The above copyright notice and this permission notice shall be included in
+	all copies or substantial portions of the Software.
+
+	THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+	IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+	FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+	AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+	LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+	OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+	THE SOFTWARE.
+*/
+#include "globals.h"
+#include "system/system.h"
+#include "system/uptime.h"
+#if CONFIG_CUSTOMER_INFO
+#include "system/customer_info.h"
+#endif
+// #include "timer.h"
+#include "connection/esb.h"
+#include "sensor/sensor.h"
+
+#include <stdint.h>
+
+#include <zephyr/sys/reboot.h>
+#include <zephyr/drivers/gpio.h>
+#define ZEPHYR_USER_NODE DT_PATH(zephyr_user)
+#if DT_NODE_HAS_PROP(ZEPHYR_USER_NODE, pwr_gpios)
+static const struct gpio_dt_spec pwr = GPIO_DT_SPEC_GET(ZEPHYR_USER_NODE, pwr_gpios);
+#else
+#if CONFIG_BOARD_PROMICRO_UF2
+#warning "IMU power pins not defined: do not stack IMU on PROMICRO"
+#endif // CONFIG_BOARD_PROMICRO_UF2
+#endif
+#if DT_NODE_HAS_PROP(ZEPHYR_USER_NODE, gnd_gpios)
+static const struct gpio_dt_spec gnd = GPIO_DT_SPEC_GET(ZEPHYR_USER_NODE, gnd_gpios);
+#else
+#if CONFIG_BOARD_PROMICRO_UF2
+#warning "IMU gnd pins not defined: do not stack IMU on PROMICRO"
+#endif // CONFIG_BOARD_PROMICRO_UF2
+#endif
+
+LOG_MODULE_REGISTER(main, LOG_LEVEL_INF);
+
+#if DT_NODE_HAS_PROP(DT_ALIAS(sw0), gpios)
+#define BUTTON_EXISTS true
+#endif
+
+#define ADAFRUIT_BOOTLOADER (CONFIG_BUILD_OUTPUT_UF2 && !CONFIG_BOOTLOADER_MCUBOOT)
+
+int main(void)
+{
+#if DT_NODE_HAS_PROP(ZEPHYR_USER_NODE, gnd_gpios)
+	gpio_pin_configure_dt(&gnd, GPIO_OUTPUT_ACTIVE);
+	gpio_pin_set_dt(&gnd, 0);
+#endif
+#if DT_NODE_HAS_PROP(ZEPHYR_USER_NODE, pwr_gpios)
+	gpio_pin_configure_dt(&pwr, GPIO_OUTPUT_ACTIVE);
+	gpio_pin_set_dt(&pwr, 1);
+#endif
+#if IGNORE_RESET && BUTTON_EXISTS
+	bool reset_pin_reset = false;
+#else
+#ifdef NRF_RESET
+	bool reset_pin_reset = sys_get_reset_reason() & RESET_RESETREAS_RESETPIN_Msk;
+#else
+	bool reset_pin_reset = sys_get_reset_reason() & POWER_RESETREAS_RESETPIN_Msk;
+#endif
+#endif
+
+	/* Boot is not a new button input. Initialization/link/readiness owners
+	 * publish their real states without an extra startup ACK color change. */
+
+	uint8_t reboot_counter = reboot_counter_read();
+	bool booting_from_shutdown
+		= !reboot_counter && (reset_pin_reset || button_read()); // 0 means from user shutdown or failed ram validation
+
+	if (button_read()) {
+		while (button_read()) {
+			if (system_uptime_since_boot_ms() > 5000) {
+#if CONFIG_USER_EXTRA_ACTIONS
+				LOG_INF("Button long hold timeout, continuing boot");
+#else
+				LOG_INF("Pairing requested");
+				esb_reset_pair();
+#endif
+				break;
+			}
+			k_msleep(1);
+		}
+	}
+
+	bool docked = dock_read();
+
+	if (reboot_counter == 0) {
+		reboot_counter = 100;
+	} else if (reboot_counter > 200) {
+		reboot_counter = 200; // How did you get here
+	}
+	uint8_t reset_mode = reboot_counter - 100;
+	if (reset_pin_reset && !docked) // Count pin resets while not docked
+	{
+		reboot_counter++;
+		reboot_counter_write(reboot_counter);
+		LOG_INF("Reset count: %u", reboot_counter);
+#if ADAFRUIT_BOOTLOADER                                                                                                \
+	&& !(IGNORE_RESET && BUTTON_EXISTS)       // Using Adafruit bootloader, skip DFU if reset button is in use
+	sys_skip_dfu(); // Skip DFU
+#endif
+		k_msleep(1000); // Wait before clearing counter and continuing
+	}
+	reboot_counter_write(100);
+	if (!reset_pin_reset
+		&& reset_mode
+			   == 0) { // Only need to check once, if the button is pressed again an interrupt is triggered from before
+		const uint8_t reset_mode_cancelled = UINT8_MAX;
+		reset_mode = reset_mode_cancelled;
+	}
+
+#if USER_SHUTDOWN_ENABLED
+#if DT_NODE_HAS_PROP(DT_PATH(zephyr_user), stat_gpios)
+	bool charging = false, charged = false;
+	(void)sys_charger_snapshot(&charging, &charged);
+#else
+	bool charging = chg_read();
+	bool charged = stby_read();
+#endif
+	/* STAT high-Z does not establish external-power absence. */
+	bool plugged = vin_read() || vbus_read();
+
+	if (reset_mode == 0 && !booting_from_shutdown && !charging && !charged
+		&& !plugged) { // Reset mode user shutdown, only if unplugged and undocked
+		sys_user_shutdown();
+	}
+#endif
+
+	if (!booting_from_shutdown) {
+		k_usleep(60);
+	}
+
+	sys_reset_mode(reset_mode);
+#if CONFIG_CUSTOMER_INFO
+	customer_info_report(CUSTOMER_INFO_REPORT_LOG_SUMMARY);
+#endif
+
+	return 0;
+}
